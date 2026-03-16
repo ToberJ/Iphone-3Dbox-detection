@@ -1,8 +1,9 @@
 import UIKit
 import ARKit
 import SceneKit
+import ImageIO
 
-class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
+class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UITextFieldDelegate {
 
     private var sceneView: ARSCNView!
     private var bboxRenderer: BBoxRenderer!
@@ -13,6 +14,17 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     private var captureButton: UIButton!
     private var activityIndicator: UIActivityIndicatorView!
     private var settingsButton: UIButton!
+    private var promptTextField: UITextField!
+    private var promptBar: UIView!
+    private var modeSegment: UISegmentedControl!
+    private var captureSegment: UISegmentedControl!
+    private var sendDepth = true
+    private var alignmentPostProcess = true
+    private var isVideoMode = false
+    private var videoFrames: [CaptureData] = []
+    private var videoTimer: Timer?
+    private let videoFrameCount = 15
+    private let videoFrameInterval: TimeInterval = 0.2
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -21,10 +33,19 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         bboxRenderer = BBoxRenderer(scene: sceneView.scene)
     }
 
+    private var isLiDARAvailable = false
+
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = []
+        isLiDARAvailable = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        if isLiDARAvailable {
+            config.frameSemantics = .sceneDepth
+            print("[AR] LiDAR depth enabled")
+        } else {
+            print("[AR] No LiDAR - monocular fallback")
+        }
         sceneView.session.run(config)
     }
 
@@ -55,7 +76,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         statusLabel.textAlignment = .center
         statusLabel.layer.cornerRadius = 8
         statusLabel.clipsToBounds = true
-        statusLabel.text = " Ready - Tap Detect to capture "
+        statusLabel.text = " Ready - Tap Detect "
         view.addSubview(statusLabel)
 
         captureButton = UIButton(type: .system)
@@ -64,7 +85,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         captureButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .bold)
         captureButton.setTitleColor(.white, for: .normal)
         captureButton.backgroundColor = UIColor.systemBlue
-        captureButton.layer.cornerRadius = 30
+        captureButton.layer.cornerRadius = 25
         captureButton.addTarget(self, action: #selector(captureAndDetect), for: .touchUpInside)
         view.addSubview(captureButton)
 
@@ -83,23 +104,96 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         settingsButton.addTarget(self, action: #selector(showSettings), for: .touchUpInside)
         view.addSubview(settingsButton)
 
-        NSLayoutConstraint.activate([
-            statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            statusLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
+        // Prompt bar for class input
+        promptBar = UIView()
+        promptBar.translatesAutoresizingMaskIntoConstraints = false
+        promptBar.backgroundColor = UIColor.black.withAlphaComponent(0.75)
+        promptBar.layer.cornerRadius = 12
+        view.addSubview(promptBar)
 
-            captureButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -30),
-            captureButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            captureButton.widthAnchor.constraint(equalToConstant: 140),
-            captureButton.heightAnchor.constraint(equalToConstant: 60),
+        let promptLabel = UILabel()
+        promptLabel.translatesAutoresizingMaskIntoConstraints = false
+        promptLabel.text = "Classes:"
+        promptLabel.textColor = .lightGray
+        promptLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        promptBar.addSubview(promptLabel)
+
+        promptTextField = UITextField()
+        promptTextField.translatesAutoresizingMaskIntoConstraints = false
+        promptTextField.text = DetectionService.shared.textPrompt
+        promptTextField.textColor = .white
+        promptTextField.font = .systemFont(ofSize: 14)
+        promptTextField.returnKeyType = .done
+        promptTextField.autocorrectionType = .no
+        promptTextField.autocapitalizationType = .none
+        promptTextField.attributedPlaceholder = NSAttributedString(
+            string: "e.g. monitor.keyboard.chair",
+            attributes: [.foregroundColor: UIColor.gray]
+        )
+        promptTextField.addTarget(self, action: #selector(promptChanged), for: .editingDidEnd)
+        promptTextField.delegate = self
+        promptBar.addSubview(promptTextField)
+
+        modeSegment = UISegmentedControl(items: ["RGB", "RGBD", "RGBD+SAM2"])
+        modeSegment.translatesAutoresizingMaskIntoConstraints = false
+        modeSegment.selectedSegmentIndex = 2
+        modeSegment.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        modeSegment.selectedSegmentTintColor = UIColor.systemBlue
+        modeSegment.setTitleTextAttributes([.foregroundColor: UIColor.lightGray, .font: UIFont.systemFont(ofSize: 13, weight: .medium)], for: .normal)
+        modeSegment.setTitleTextAttributes([.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 13, weight: .bold)], for: .selected)
+        modeSegment.addTarget(self, action: #selector(modeChanged), for: .valueChanged)
+        view.addSubview(modeSegment)
+
+        captureSegment = UISegmentedControl(items: ["Single", "Video"])
+        captureSegment.translatesAutoresizingMaskIntoConstraints = false
+        captureSegment.selectedSegmentIndex = 0
+        captureSegment.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        captureSegment.selectedSegmentTintColor = UIColor.systemOrange
+        captureSegment.setTitleTextAttributes([.foregroundColor: UIColor.lightGray, .font: UIFont.systemFont(ofSize: 13, weight: .medium)], for: .normal)
+        captureSegment.setTitleTextAttributes([.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 13, weight: .bold)], for: .selected)
+        captureSegment.addTarget(self, action: #selector(captureSegmentChanged), for: .valueChanged)
+        view.addSubview(captureSegment)
+
+        NSLayoutConstraint.activate([
+            // Top row: prompt bar + mode segment + settings gear
+            promptBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            promptBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            promptBar.trailingAnchor.constraint(equalTo: modeSegment.leadingAnchor, constant: -8),
+            promptBar.heightAnchor.constraint(equalToConstant: 40),
+
+            promptLabel.leadingAnchor.constraint(equalTo: promptBar.leadingAnchor, constant: 12),
+            promptLabel.centerYAnchor.constraint(equalTo: promptBar.centerYAnchor),
+
+            promptTextField.leadingAnchor.constraint(equalTo: promptLabel.trailingAnchor, constant: 8),
+            promptTextField.trailingAnchor.constraint(equalTo: promptBar.trailingAnchor, constant: -12),
+            promptTextField.centerYAnchor.constraint(equalTo: promptBar.centerYAnchor),
+
+            modeSegment.centerYAnchor.constraint(equalTo: promptBar.centerYAnchor),
+            modeSegment.trailingAnchor.constraint(equalTo: settingsButton.leadingAnchor, constant: -8),
+            modeSegment.heightAnchor.constraint(equalToConstant: 32),
+
+            settingsButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            settingsButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            settingsButton.widthAnchor.constraint(equalToConstant: 40),
+            settingsButton.heightAnchor.constraint(equalToConstant: 40),
+
+            // Status below top bar
+            statusLabel.topAnchor.constraint(equalTo: promptBar.bottomAnchor, constant: 8),
+            statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            statusLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 28),
 
             activityIndicator.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
             activityIndicator.trailingAnchor.constraint(equalTo: statusLabel.leadingAnchor, constant: -8),
 
-            settingsButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            settingsButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            settingsButton.widthAnchor.constraint(equalToConstant: 40),
-            settingsButton.heightAnchor.constraint(equalToConstant: 40),
+            // Bottom row: capture segment (left) + detect button (right)
+            captureSegment.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18),
+            captureSegment.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            captureSegment.heightAnchor.constraint(equalToConstant: 32),
+
+            captureButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+            captureButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            captureButton.widthAnchor.constraint(equalToConstant: 120),
+            captureButton.heightAnchor.constraint(equalToConstant: 50),
         ])
     }
 
@@ -118,34 +212,33 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
 
     @objc private func captureAndDetect() {
         guard !isDetecting else { return }
-        guard let frame = sceneView.session.currentFrame else {
+        guard sceneView.session.currentFrame != nil else {
             updateStatus("AR session not ready")
             return
         }
 
         isDetecting = true
         captureButton.isEnabled = false
-        updateStatus("Capturing...", showSpinner: true)
 
+        if isVideoMode {
+            startVideoCapture()
+        } else {
+            singleCapture()
+        }
+    }
+
+    private func singleCapture() {
+        guard let frame = sceneView.session.currentFrame else { return }
+        updateStatus("Capturing...", showSpinner: true)
         flashScreen()
 
         let captureData = extractCaptureData(from: frame)
-
         updateStatus("Detecting objects...", showSpinner: true)
 
         Task {
             do {
-                let boxes = try await DetectionService.shared.detect(capture: captureData)
-                await MainActor.run {
-                    if boxes.isEmpty {
-                        updateStatus("No objects detected")
-                    } else {
-                        let summary = boxes.map { "\($0.label)(\(String(format: "%.0f%%", $0.score * 100)))" }.joined(separator: ", ")
-                        updateStatus("Found \(boxes.count): \(summary)")
-                        bboxRenderer.showBoxes(boxes)
-                    }
-                    finishDetection()
-                }
+                let result = try await DetectionService.shared.detect(capture: captureData)
+                await MainActor.run { handleResult(result) }
             } catch {
                 await MainActor.run {
                     updateStatus("Error: \(error.localizedDescription)")
@@ -153,6 +246,76 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
                 }
             }
         }
+    }
+
+    // MARK: - Video Capture
+
+    private func startVideoCapture() {
+        videoFrames = []
+        updateStatus("Recording 0/\(videoFrameCount)...", showSpinner: true)
+        flashScreen()
+
+        captureVideoFrame()
+
+        videoTimer = Timer.scheduledTimer(withTimeInterval: videoFrameInterval, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            self.captureVideoFrame()
+
+            if self.videoFrames.count >= self.videoFrameCount {
+                timer.invalidate()
+                self.videoTimer = nil
+                self.finishVideoCapture()
+            }
+        }
+    }
+
+    private func captureVideoFrame() {
+        guard let frame = sceneView.session.currentFrame else { return }
+        let data = extractCaptureData(from: frame)
+        videoFrames.append(data)
+        let count = videoFrames.count
+        print("[Video] Captured frame \(count)/\(videoFrameCount)")
+        updateStatus("Recording \(count)/\(videoFrameCount)...", showSpinner: true)
+    }
+
+    private func finishVideoCapture() {
+        let frames = videoFrames
+        videoFrames = []
+
+        updateStatus("Detecting (\(frames.count) frames)...", showSpinner: true)
+        print("[Video] Sending \(frames.count) frames to API")
+
+        Task {
+            do {
+                let result = try await DetectionService.shared.detectMultiFrame(captures: frames)
+                await MainActor.run { handleResult(result) }
+            } catch {
+                await MainActor.run {
+                    updateStatus("Error: \(error.localizedDescription)")
+                    finishDetection()
+                }
+            }
+        }
+    }
+
+    // MARK: - Result Handling
+
+    private func handleResult(_ result: DetectionResponse) {
+        let modeTag = "[\(result.mode ?? "?")]"
+        if result.boxes.isEmpty {
+            updateStatus("\(modeTag) No objects detected")
+        } else {
+            let summary = result.boxes.map { box -> String in
+                let pct = String(format: "%.0f%%", box.score * 100)
+                if let nf = box.n_frames {
+                    return "\(box.label)(\(pct),\(nf)f)"
+                }
+                return "\(box.label)(\(pct))"
+            }.joined(separator: ", ")
+            updateStatus("\(modeTag) Found \(result.boxes.count): \(summary)")
+            bboxRenderer.showBoxes(result.boxes)
+        }
+        finishDetection()
     }
 
     private func finishDetection() {
@@ -224,25 +387,109 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             [0, 0, 0, 1],
         ]
 
+        var depthPng: Data? = nil
+        if sendDepth, let sceneDepth = frame.sceneDepth {
+            depthPng = depthMapTo16BitPNG(sceneDepth.depthMap)
+            print("[Capture] Depth: \(CVPixelBufferGetWidth(sceneDepth.depthMap))x\(CVPixelBufferGetHeight(sceneDepth.depthMap)), PNG: \(depthPng?.count ?? 0)B")
+        } else {
+            print("[Capture] Depth skipped (mode=\(sendDepth ? "depth" : "rgb-only"), hasLiDAR=\(frame.sceneDepth != nil))")
+        }
+
         print("[Capture] Original: \(Int(origW))x\(Int(origH)), Resized: \(Int(newW))x\(Int(newH)), PNG: \(pngData.count/1024)KB")
         print("[Capture] K: fx=\(fx) fy=\(fy) cx=\(cx) cy=\(cy) (raw=\(cyRaw), H=\(Int(newH)))")
 
-        return CaptureData(pngData: pngData, intrinsicK: K, cameraToWorld: camToWorld)
+        return CaptureData(pngData: pngData, depthPngData: depthPng, alignmentPostProcess: alignmentPostProcess, intrinsicK: K, cameraToWorld: camToWorld)
+    }
+
+    private func depthMapTo16BitPNG(_ depthMap: CVPixelBuffer) -> Data? {
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+        let w = CVPixelBufferGetWidth(depthMap)
+        let h = CVPixelBufferGetHeight(depthMap)
+        let rowBytes = CVPixelBufferGetBytesPerRow(depthMap)
+        guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+        let floatPtr = base.assumingMemoryBound(to: Float32.self)
+        let stride = rowBytes / 4
+
+        var uint16Data = [UInt16](repeating: 0, count: w * h)
+        for y in 0..<h {
+            for x in 0..<w {
+                let meters = floatPtr[y * stride + x]
+                if meters > 0 && meters < 65.535 {
+                    uint16Data[y * w + x] = UInt16(meters * 1000.0)
+                }
+            }
+        }
+
+        return uint16Data.withUnsafeMutableBytes { rawBuf -> Data? in
+            guard let ptr = rawBuf.baseAddress else { return nil }
+            let bitmapInfo = CGBitmapInfo(rawValue: CGImageByteOrderInfo.order16Little.rawValue)
+            guard let provider = CGDataProvider(data: NSData(bytes: ptr, length: w * h * 2)),
+                  let cgImage = CGImage(width: w, height: h,
+                                        bitsPerComponent: 16, bitsPerPixel: 16,
+                                        bytesPerRow: w * 2,
+                                        space: CGColorSpaceCreateDeviceGray(),
+                                        bitmapInfo: bitmapInfo,
+                                        provider: provider,
+                                        decode: nil, shouldInterpolate: false,
+                                        intent: .defaultIntent)
+            else { return nil }
+
+            let mutableData = NSMutableData()
+            guard let dest = CGImageDestinationCreateWithData(mutableData as CFMutableData, "public.png" as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(dest, cgImage, nil)
+            guard CGImageDestinationFinalize(dest) else { return nil }
+            return mutableData as Data
+        }
+    }
+
+    // MARK: - Capture Mode Toggle
+
+    @objc private func captureSegmentChanged() {
+        isVideoMode = captureSegment.selectedSegmentIndex == 1
+        captureButton.setTitle(isVideoMode ? "  Record  " : "  Detect  ", for: .normal)
+        captureButton.backgroundColor = isVideoMode ? UIColor.systemRed : UIColor.systemBlue
+        print("[CaptureMode] \(isVideoMode ? "Video (5 frames)" : "Single")")
+    }
+
+    // MARK: - Depth Mode Toggle
+
+    @objc private func modeChanged() {
+        let idx = modeSegment.selectedSegmentIndex
+        sendDepth = idx >= 1
+        alignmentPostProcess = idx == 2
+        let modes = ["RGB", "RGBD", "RGBD+SAM2"]
+        print("[Mode] Switched to \(modes[idx])")
+        if sendDepth && !isLiDARAvailable {
+            updateStatus("No LiDAR on this device - will use monocular")
+        }
+    }
+
+    // MARK: - Prompt Input
+
+    @objc private func promptChanged() {
+        if let text = promptTextField.text, !text.isEmpty {
+            DetectionService.shared.textPrompt = text
+            print("[Prompt] Updated to: \(text)")
+        }
+    }
+
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        textField.resignFirstResponder()
+        promptChanged()
+        return true
     }
 
     // MARK: - Settings
 
     @objc private func showSettings() {
-        let alert = UIAlertController(title: "Detection Settings", message: nil, preferredStyle: .alert)
+        let alert = UIAlertController(title: "Settings", message: nil, preferredStyle: .alert)
 
         alert.addTextField { tf in
             tf.text = DetectionService.shared.apiUrl
             tf.placeholder = "API URL"
             tf.font = .systemFont(ofSize: 12)
-        }
-        alert.addTextField { tf in
-            tf.text = DetectionService.shared.textPrompt
-            tf.placeholder = "Text prompt (dot-separated)"
         }
         alert.addTextField { tf in
             tf.text = String(DetectionService.shared.scoreThreshold)
@@ -255,10 +502,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             if let url = alert.textFields?[0].text, !url.isEmpty {
                 DetectionService.shared.apiUrl = url
             }
-            if let prompt = alert.textFields?[1].text, !prompt.isEmpty {
-                DetectionService.shared.textPrompt = prompt
-            }
-            if let threshStr = alert.textFields?[2].text, let thresh = Float(threshStr) {
+            if let threshStr = alert.textFields?[1].text, let thresh = Float(threshStr) {
                 DetectionService.shared.scoreThreshold = max(0, min(1, thresh))
             }
         })

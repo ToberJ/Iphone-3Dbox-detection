@@ -8,6 +8,7 @@ struct BBox3D: Codable {
     let rotation: [Float]?
     let color: [Float]?
     let score: Float
+    let n_frames: Int?
 
     var centerSIMD: simd_float3 {
         simd_float3(center[0], center[1], center[2])
@@ -30,10 +31,13 @@ struct BBox3D: Codable {
 
 struct DetectionResponse: Codable {
     let boxes: [BBox3D]
+    let mode: String?
 }
 
 struct CaptureData {
     let pngData: Data
+    let depthPngData: Data?
+    let alignmentPostProcess: Bool
     let intrinsicK: [[Float]]
     let cameraToWorld: [[Float]]
 }
