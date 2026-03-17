@@ -20,11 +20,13 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private var captureSegment: UISegmentedControl!
     private var sendDepth = true
     private var alignmentPostProcess = true
-    private var isVideoMode = false
+    private var captureMode = 0  // 0=Single, 1=Multi-View, 2=Video
     private var videoFrames: [CaptureData] = []
     private var videoTimer: Timer?
     private let videoFrameCount = 15
     private let videoFrameInterval: TimeInterval = 0.2
+    private var multiViewFrames: [CaptureData] = []
+    private var multiViewDetectButton: UIButton!
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -89,6 +91,17 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         captureButton.addTarget(self, action: #selector(captureAndDetect), for: .touchUpInside)
         view.addSubview(captureButton)
 
+        multiViewDetectButton = UIButton(type: .system)
+        multiViewDetectButton.translatesAutoresizingMaskIntoConstraints = false
+        multiViewDetectButton.setTitle("  Detect  ", for: .normal)
+        multiViewDetectButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .bold)
+        multiViewDetectButton.setTitleColor(.white, for: .normal)
+        multiViewDetectButton.backgroundColor = UIColor.systemBlue
+        multiViewDetectButton.layer.cornerRadius = 25
+        multiViewDetectButton.addTarget(self, action: #selector(sendMultiViewDetection), for: .touchUpInside)
+        multiViewDetectButton.isHidden = true
+        view.addSubview(multiViewDetectButton)
+
         activityIndicator = UIActivityIndicatorView(style: .medium)
         activityIndicator.translatesAutoresizingMaskIntoConstraints = false
         activityIndicator.color = .white
@@ -144,7 +157,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         modeSegment.addTarget(self, action: #selector(modeChanged), for: .valueChanged)
         view.addSubview(modeSegment)
 
-        captureSegment = UISegmentedControl(items: ["Single", "Video"])
+        captureSegment = UISegmentedControl(items: ["Single", "Multi-View", "Video"])
         captureSegment.translatesAutoresizingMaskIntoConstraints = false
         captureSegment.selectedSegmentIndex = 0
         captureSegment.backgroundColor = UIColor.black.withAlphaComponent(0.6)
@@ -194,6 +207,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             captureButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
             captureButton.widthAnchor.constraint(equalToConstant: 120),
             captureButton.heightAnchor.constraint(equalToConstant: 50),
+
+            multiViewDetectButton.bottomAnchor.constraint(equalTo: captureButton.bottomAnchor),
+            multiViewDetectButton.trailingAnchor.constraint(equalTo: captureButton.leadingAnchor, constant: -12),
+            multiViewDetectButton.widthAnchor.constraint(equalToConstant: 120),
+            multiViewDetectButton.heightAnchor.constraint(equalToConstant: 50),
         ])
     }
 
@@ -211,6 +229,12 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     // MARK: - Capture & Detect
 
     @objc private func captureAndDetect() {
+        // Multi-view allows tapping again while "detecting" (collecting frames)
+        if captureMode == 1 && !multiViewFrames.isEmpty {
+            captureMultiViewFrame()
+            return
+        }
+
         guard !isDetecting else { return }
         guard sceneView.session.currentFrame != nil else {
             updateStatus("AR session not ready")
@@ -220,9 +244,12 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         isDetecting = true
         captureButton.isEnabled = false
 
-        if isVideoMode {
+        switch captureMode {
+        case 1:
+            startMultiViewCapture()
+        case 2:
             startVideoCapture()
-        } else {
+        default:
             singleCapture()
         }
     }
@@ -246,6 +273,73 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
                 }
             }
         }
+    }
+
+    // MARK: - Multi-View Capture
+
+    private func startMultiViewCapture() {
+        multiViewFrames = []
+        guard let frame = sceneView.session.currentFrame else { return }
+        flashScreen()
+        let data = extractCaptureData(from: frame)
+        multiViewFrames.append(data)
+        print("[MultiView] Captured main frame")
+
+        updateStatus("Main captured — move to a different angle and tap + Ref")
+        captureButton.setTitle("  + Ref  ", for: .normal)
+        captureButton.backgroundColor = UIColor.systemTeal
+        captureButton.isEnabled = true
+    }
+
+    private func captureMultiViewFrame() {
+        guard let frame = sceneView.session.currentFrame else { return }
+        flashScreen()
+        let data = extractCaptureData(from: frame)
+        multiViewFrames.append(data)
+        let refCount = multiViewFrames.count - 1
+        print("[MultiView] Captured ref \(refCount)")
+
+        multiViewDetectButton.isHidden = false
+        updateStatus("Main + \(refCount) ref(s) — tap + Ref for more, or Detect to send")
+    }
+
+    @objc private func sendMultiViewDetection() {
+        guard multiViewFrames.count >= 2 else { return }
+        captureButton.isEnabled = false
+        multiViewDetectButton.isHidden = true
+
+        let frames = multiViewFrames
+        multiViewFrames = []
+
+        let mainFrame = frames[0]
+        let refFrames = Array(frames[1...])
+
+        updateStatus("Detecting (main + \(refFrames.count) ref)...", showSpinner: true)
+        print("[MultiView] Sending main + \(refFrames.count) ref frame(s) to API")
+
+        Task {
+            do {
+                let result = try await DetectionService.shared.detectWithReferences(main: mainFrame, references: refFrames)
+                await MainActor.run {
+                    handleResult(result)
+                    resetCaptureButton()
+                }
+            } catch {
+                await MainActor.run {
+                    updateStatus("Error: \(error.localizedDescription)")
+                    finishDetection()
+                    resetCaptureButton()
+                }
+            }
+        }
+    }
+
+    private func resetCaptureButton() {
+        let titles = ["  Detect  ", "  Main  ", "  Record  "]
+        let colors = [UIColor.systemBlue, UIColor.systemGreen, UIColor.systemRed]
+        captureButton.setTitle(titles[captureMode], for: .normal)
+        captureButton.backgroundColor = colors[captureMode]
+        multiViewDetectButton.isHidden = true
     }
 
     // MARK: - Video Capture
@@ -321,6 +415,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private func finishDetection() {
         isDetecting = false
         captureButton.isEnabled = true
+        resetCaptureButton()
     }
 
     private func flashScreen() {
@@ -447,10 +542,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     // MARK: - Capture Mode Toggle
 
     @objc private func captureSegmentChanged() {
-        isVideoMode = captureSegment.selectedSegmentIndex == 1
-        captureButton.setTitle(isVideoMode ? "  Record  " : "  Detect  ", for: .normal)
-        captureButton.backgroundColor = isVideoMode ? UIColor.systemRed : UIColor.systemBlue
-        print("[CaptureMode] \(isVideoMode ? "Video (5 frames)" : "Single")")
+        captureMode = captureSegment.selectedSegmentIndex
+        multiViewFrames = []
+        resetCaptureButton()
+        let modeNames = ["Single", "Multi-View", "Video (\(videoFrameCount) frames)"]
+        print("[CaptureMode] \(modeNames[captureMode])")
     }
 
     // MARK: - Depth Mode Toggle

@@ -116,6 +116,70 @@ class DetectionService {
         print("[DetectionClient] Multi-frame detected \(result.boxes.count) objects, mode=\(result.mode ?? "unknown")")
         return result
     }
+
+    func detectWithReferences(main: CaptureData, references: [CaptureData]) async throws -> DetectionResponse {
+        print("[DetectionClient] Multi-view ref: main + \(references.count) reference(s)")
+
+        var body: [String: Any] = [
+            "image_base64": main.pngData.base64EncodedString(),
+            "intrinsic": ["K": main.intrinsicK],
+            "camera_to_world": ["matrix_4x4": main.cameraToWorld],
+            "text_prompt": textPrompt,
+            "score_threshold": scoreThreshold,
+            "alignment_post_process": main.alignmentPostProcess,
+            "source": "iphone"
+        ]
+
+        if let depthData = main.depthPngData {
+            body["depth_base64"] = depthData.base64EncodedString()
+            print("[DetectionClient] Main: img=\(main.pngData.count/1024)KB, depth=\(depthData.count)B")
+        } else {
+            print("[DetectionClient] Main: img=\(main.pngData.count/1024)KB, no depth")
+        }
+
+        var refArray: [[String: Any]] = []
+        for (i, ref) in references.enumerated() {
+            var refDict: [String: Any] = [
+                "intrinsic": ["K": ref.intrinsicK],
+                "camera_to_world": ["matrix_4x4": ref.cameraToWorld]
+            ]
+            if let depthData = ref.depthPngData {
+                refDict["depth_base64"] = depthData.base64EncodedString()
+            }
+            refDict["image_base64"] = ref.pngData.base64EncodedString()
+            refArray.append(refDict)
+            print("[DetectionClient] Ref \(i): img=\(ref.pngData.count/1024)KB, depth=\(ref.depthPngData?.count ?? 0)B")
+        }
+        body["reference_frames"] = refArray
+
+        let jsonData = try JSONSerialization.data(withJSONObject: body)
+        print("[DetectionClient] Multi-view ref payload: \(jsonData.count / 1024)KB to \(apiUrl)")
+
+        var request = URLRequest(url: URL(string: apiUrl)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+        request.timeoutInterval = 120
+        request.httpBody = jsonData
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        print("[DetectionClient] Response status: \(statusCode), body size: \(data.count)")
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "no body"
+            print("[DetectionClient] ERROR: \(responseBody)")
+            throw DetectionError.serverError(statusCode: statusCode, message: responseBody)
+        }
+
+        let responseText = String(data: data, encoding: .utf8) ?? ""
+        print("[DetectionClient] Response: \(responseText.prefix(500))")
+
+        let result = try JSONDecoder().decode(DetectionResponse.self, from: data)
+        print("[DetectionClient] Multi-view ref detected \(result.boxes.count) objects, mode=\(result.mode ?? "unknown")")
+        return result
+    }
 }
 
 enum DetectionError: LocalizedError {
