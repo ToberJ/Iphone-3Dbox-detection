@@ -10,6 +10,9 @@ struct BoxMetadata {
 class BBoxRenderer {
     private var boxNodes: [SCNNode] = []
     private var metadata: [SCNNode: BoxMetadata] = [:]
+    private var colors: [SCNNode: UIColor] = [:]
+    private(set) var selectedNode: SCNNode?
+    private var selectionFill: SCNNode?
     private weak var scene: SCNScene?
 
     /// Tube radius for wireframe edges (meters). 4mm is visible on iPhone screens.
@@ -33,14 +36,89 @@ class BBoxRenderer {
     }
 
     func clearBoxes() {
+        deselectAll()
         for node in boxNodes {
             node.removeFromParentNode()
             metadata.removeValue(forKey: node)
+            colors.removeValue(forKey: node)
         }
         boxNodes.removeAll()
     }
 
     var boxCount: Int { boxNodes.count }
+
+    // MARK: - Selection
+
+    /// Returns the top-level box parent if the tapped node belongs to a bbox, nil otherwise.
+    func boxParent(for node: SCNNode) -> SCNNode? {
+        var current: SCNNode? = node
+        while let n = current {
+            if boxNodes.contains(n) { return n }
+            current = n.parent
+        }
+        return nil
+    }
+
+    func selectBox(_ node: SCNNode) {
+        guard boxNodes.contains(node) else { return }
+        deselectAll()
+        selectedNode = node
+        let color = colors[node] ?? .systemBlue
+        let meta = metadata[node]
+        let s = meta?.sizeMeters ?? simd_float3(0.1, 0.1, 0.1)
+
+        let boxGeo = SCNBox(width: CGFloat(s.x), height: CGFloat(s.y), length: CGFloat(s.z), chamferRadius: 0)
+        let mat = SCNMaterial()
+        mat.diffuse.contents = color.withAlphaComponent(0.3)
+        mat.isDoubleSided = true
+        boxGeo.materials = [mat]
+
+        let fill = SCNNode(geometry: boxGeo)
+        fill.name = "selectionFill"
+        node.addChildNode(fill)
+        selectionFill = fill
+    }
+
+    /// Find the nearest box to a screen tap point by projecting box centers.
+    func nearestBox(to screenPoint: CGPoint, in scnView: SCNView) -> SCNNode? {
+        var bestNode: SCNNode?
+        var bestDist: CGFloat = .greatestFiniteMagnitude
+
+        for node in boxNodes {
+            guard let meta = metadata[node] else { continue }
+            let center = node.simdWorldPosition
+            let projected = scnView.projectPoint(SCNVector3(center))
+            guard projected.z > 0 && projected.z < 1 else { continue }
+
+            let screenCenter = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+
+            let offset = center + simd_float3(0, meta.sizeMeters.y / 2, 0)
+            let projOffset = scnView.projectPoint(SCNVector3(offset))
+            let halfScreenH = abs(CGFloat(projOffset.y - projected.y))
+            let tapRadius = max(50, halfScreenH * 1.8)
+
+            let dist = hypot(screenPoint.x - screenCenter.x, screenPoint.y - screenCenter.y)
+            if dist < tapRadius && dist < bestDist {
+                bestDist = dist
+                bestNode = node
+            }
+        }
+        return bestNode
+    }
+
+    func deselectAll() {
+        selectionFill?.removeFromParentNode()
+        selectionFill = nil
+        selectedNode = nil
+    }
+
+    func removeBox(_ node: SCNNode) {
+        if selectedNode == node { deselectAll() }
+        node.removeFromParentNode()
+        boxNodes.removeAll { $0 == node }
+        metadata.removeValue(forKey: node)
+        colors.removeValue(forKey: node)
+    }
 
     func updateLabels(cameraPosition: simd_float3, useMetric: Bool) {
         let factor: Float = useMetric ? 1.0 : 3.28084
@@ -88,6 +166,7 @@ class BBoxRenderer {
 
         addWireframeEdges(to: parentNode, size: s, color: color)
         addLabel(to: parentNode, box: box, boxSize: s, color: color)
+        colors[parentNode] = color
 
         return parentNode
     }

@@ -35,11 +35,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private var detectMethodSegment: UISegmentedControl!
     private var panGesture: UIPanGestureRecognizer!
 
-    // 2D box drag
-    private var boxOverlayView: UIView!
+    // 2D box drag — multiple boxes
     private var dragStartPoint: CGPoint?
-    private var pendingBox2DCapture: CaptureData?
-    private var pendingBox2D: [Float]?
+    private var drawnBoxViews: [UIView] = []
+    private var drawnBoxCoords: [[Float]] = []
+    private var box2DCaptureData: CaptureData?
+
+    // Box selection & deletion
+    private var selectedBox2DIndex: Int?
+    private var deleteButton: UIButton!
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -85,13 +89,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         panGesture.isEnabled = false
         sceneView.addGestureRecognizer(panGesture)
 
-        boxOverlayView = UIView()
-        boxOverlayView.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.15)
-        boxOverlayView.layer.borderColor = UIColor.systemYellow.cgColor
-        boxOverlayView.layer.borderWidth = 2.5
-        boxOverlayView.isHidden = true
-        boxOverlayView.isUserInteractionEnabled = false
-        view.addSubview(boxOverlayView)
+        let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        sceneView.addGestureRecognizer(tapGesture)
     }
 
     // MARK: - HUD
@@ -152,6 +151,16 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         clearButton.layer.cornerRadius = 20
         clearButton.addTarget(self, action: #selector(clearAllBoxes), for: .touchUpInside)
         view.addSubview(clearButton)
+
+        deleteButton = UIButton(type: .system)
+        deleteButton.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
+        deleteButton.tintColor = .white
+        deleteButton.backgroundColor = UIColor.systemRed.withAlphaComponent(0.85)
+        deleteButton.layer.cornerRadius = 14
+        deleteButton.frame = CGRect(x: 0, y: 0, width: 28, height: 28)
+        deleteButton.addTarget(self, action: #selector(deleteSelectedBox), for: .touchUpInside)
+        deleteButton.isHidden = true
+        view.addSubview(deleteButton)
 
         // Prompt bar for class input
         promptBar = UIView()
@@ -285,7 +294,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
 
     @objc private func captureAndDetect() {
         if detectionMethod == 1 {
-            sendPendingBox2D()
+            sendAllBox2D()
             return
         }
 
@@ -477,8 +486,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         if detectionMethod == 1 {
             captureButton.setTitle("  Detect  ", for: .normal)
             captureButton.backgroundColor = UIColor.systemBlue
-            captureButton.isEnabled = pendingBox2D != nil
-            if pendingBox2D == nil {
+            captureButton.isEnabled = !drawnBoxCoords.isEmpty
+            if drawnBoxCoords.isEmpty {
                 updateStatus("Draw a 2D box around the object, then tap Detect")
             }
         } else {
@@ -504,38 +513,50 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
         guard let pov = sceneView.pointOfView else { return }
         bboxRenderer.updateLabels(cameraPosition: pov.simdWorldPosition, useMetric: useMetric)
+
+        if bboxRenderer.selectedNode != nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateDeleteButtonForSelected3D()
+            }
+        }
     }
 
     // MARK: - Clear Boxes
 
     @objc private func clearAllBoxes() {
-        let count = bboxRenderer.boxCount
+        let count2D = drawnBoxViews.count
+        let count3D = bboxRenderer.boxCount
+        clearDrawnBoxes()
         bboxRenderer.clearBoxes()
-        hideBoxOverlay()
-        updateStatus("\(count) box(es) cleared")
+        updateStatus("\(count3D) 3D + \(count2D) 2D box(es) cleared")
     }
 
-    // MARK: - 2D Box Drag-to-Detect
+    // MARK: - 2D Box Drawing (Multiple)
 
     @objc private func handleBoxDrag(_ gesture: UIPanGestureRecognizer) {
         let location = gesture.location(in: view)
 
         switch gesture.state {
         case .began:
+            deselectAllBoxes()
             dragStartPoint = location
-            boxOverlayView.frame = CGRect(origin: location, size: .zero)
-            boxOverlayView.isHidden = false
-            view.bringSubviewToFront(boxOverlayView)
+
+            let overlay = makeBoxOverlay()
+            overlay.frame = CGRect(origin: location, size: .zero)
+            overlay.isHidden = false
+            view.addSubview(overlay)
+            view.bringSubviewToFront(overlay)
+            drawnBoxViews.append(overlay)
 
         case .changed:
-            guard let start = dragStartPoint else { return }
+            guard let start = dragStartPoint, let overlay = drawnBoxViews.last else { return }
             let rect = CGRect(
                 x: min(start.x, location.x),
                 y: min(start.y, location.y),
                 width: abs(location.x - start.x),
                 height: abs(location.y - start.y)
             )
-            boxOverlayView.frame = rect
+            overlay.frame = rect
 
         case .ended, .cancelled:
             guard let start = dragStartPoint else { return }
@@ -543,24 +564,35 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             let endPoint = location
 
             let minDrag: CGFloat = 30
-            guard abs(endPoint.x - start.x) > minDrag && abs(endPoint.y - start.y) > minDrag else {
-                boxOverlayView.isHidden = true
+            if abs(endPoint.x - start.x) < minDrag || abs(endPoint.y - start.y) < minDrag {
+                drawnBoxViews.last?.removeFromSuperview()
+                drawnBoxViews.removeLast()
                 return
             }
 
-            storeBox2DCapture(screenStart: start, screenEnd: endPoint)
+            storeBox2DCoords(screenStart: start, screenEnd: endPoint)
 
         default:
             break
         }
     }
 
-    /// Capture current frame and compute box2D pixel coordinates, but don't send yet.
-    private func storeBox2DCapture(screenStart: CGPoint, screenEnd: CGPoint) {
-        guard let frame = sceneView.session.currentFrame else { return }
-        flashScreen()
+    private func makeBoxOverlay() -> UIView {
+        let v = UIView()
+        v.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.15)
+        v.layer.borderColor = UIColor.systemYellow.cgColor
+        v.layer.borderWidth = 2.5
+        v.isUserInteractionEnabled = false
+        return v
+    }
 
-        let captureData = extractCaptureData(from: frame)
+    private func storeBox2DCoords(screenStart: CGPoint, screenEnd: CGPoint) {
+        guard let frame = sceneView.session.currentFrame else { return }
+
+        if box2DCaptureData == nil {
+            flashScreen()
+            box2DCaptureData = extractCaptureData(from: frame)
+        }
 
         let viewSize = sceneView.bounds.size
         let dt = frame.displayTransform(for: .landscapeRight, viewportSize: viewSize)
@@ -584,51 +616,175 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         let y2 = Float(max(imgStart.y, imgEnd.y) * imgH)
         let box2D = [max(0, x1), max(0, y1), min(Float(imgW), x2), min(Float(imgH), y2)]
 
-        pendingBox2DCapture = captureData
-        pendingBox2D = box2D
+        drawnBoxCoords.append(box2D)
         captureButton.isEnabled = true
 
-        print("[Box2D] Stored: [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])] in \(Int(imgW))x\(Int(imgH))")
-        updateStatus("2D box ready — tap Detect to send, or redraw")
+        print("[Box2D] Stored box #\(drawnBoxCoords.count): [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])] in \(Int(imgW))x\(Int(imgH))")
+        updateStatus("\(drawnBoxCoords.count) box(es) drawn — draw more or tap Detect")
     }
 
-    private func sendPendingBox2D() {
-        guard let capture = pendingBox2DCapture, let box2D = pendingBox2D else { return }
+    private func sendAllBox2D() {
+        guard let capture = box2DCaptureData, !drawnBoxCoords.isEmpty else { return }
         guard !isDetecting else { return }
 
         isDetecting = true
         captureButton.isEnabled = false
-        updateStatus("Detecting from 2D box...", showSpinner: true)
+        let count = drawnBoxCoords.count
+        updateStatus("Detecting \(count) box(es)...", showSpinner: true)
 
-        print("[Box2D] Sending: [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])]")
+        let coordsCopy = drawnBoxCoords
+        let captureCopy = capture
 
         Task {
-            do {
-                let result = try await DetectionService.shared.detectWithBox2D(capture: capture, box2D: box2D)
-                await MainActor.run {
-                    hideBoxOverlay()
-                    pendingBox2DCapture = nil
-                    pendingBox2D = nil
-                    handleResult(result)
+            var allBoxes: [BBox3D] = []
+            var lastMode: String?
+            var errorMsg: String?
+
+            await withTaskGroup(of: (DetectionResponse?, Error?).self) { group in
+                for (i, box2D) in coordsCopy.enumerated() {
+                    group.addTask {
+                        do {
+                            print("[Box2D] Sending box \(i+1)/\(count)")
+                            let result = try await DetectionService.shared.detectWithBox2D(capture: captureCopy, box2D: box2D)
+                            return (result, nil)
+                        } catch {
+                            return (nil, error)
+                        }
+                    }
                 }
-            } catch {
-                await MainActor.run {
-                    hideBoxOverlay()
-                    pendingBox2DCapture = nil
-                    pendingBox2D = nil
-                    updateStatus("Error: \(error.localizedDescription)")
+                for await (result, error) in group {
+                    if let r = result {
+                        allBoxes.append(contentsOf: r.boxes)
+                        lastMode = r.mode
+                    } else if let e = error, errorMsg == nil {
+                        errorMsg = e.localizedDescription
+                    }
+                }
+            }
+
+            await MainActor.run {
+                clearDrawnBoxes()
+                if !allBoxes.isEmpty {
+                    let combined = DetectionResponse(boxes: allBoxes, mode: lastMode)
+                    handleResult(combined)
+                } else if let err = errorMsg {
+                    updateStatus("Error: \(err)")
+                    finishDetection()
+                } else {
+                    updateStatus("No objects detected from \(count) box(es)")
                     finishDetection()
                 }
             }
         }
     }
 
-    private func hideBoxOverlay() {
-        UIView.animate(withDuration: 0.3) {
-            self.boxOverlayView.alpha = 0
-        } completion: { _ in
-            self.boxOverlayView.isHidden = true
-            self.boxOverlayView.alpha = 1
+    private func clearDrawnBoxes() {
+        for v in drawnBoxViews { v.removeFromSuperview() }
+        drawnBoxViews.removeAll()
+        drawnBoxCoords.removeAll()
+        box2DCaptureData = nil
+        selectedBox2DIndex = nil
+        deleteButton.isHidden = true
+    }
+
+    // MARK: - Box Selection & Deletion
+
+    @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        let point = gesture.location(in: view)
+
+        // Check 2D boxes first (only in 2D Box mode)
+        if detectionMethod == 1 {
+            for (i, boxView) in drawnBoxViews.enumerated().reversed() {
+                if boxView.frame.contains(point) {
+                    selectBox2D(at: i)
+                    return
+                }
+            }
+        }
+
+        // Check 3D boxes by projecting centers to screen (much easier to tap)
+        let scenePoint = gesture.location(in: sceneView)
+        if let boxNode = bboxRenderer.nearestBox(to: scenePoint, in: sceneView) {
+            selectBox3D(boxNode)
+            return
+        }
+
+        // Tap on empty → deselect
+        deselectAllBoxes()
+    }
+
+    private func selectBox2D(at index: Int) {
+        deselectAllBoxes()
+        selectedBox2DIndex = index
+        let boxView = drawnBoxViews[index]
+        boxView.layer.borderColor = UIColor.systemRed.cgColor
+        boxView.backgroundColor = UIColor.systemRed.withAlphaComponent(0.25)
+
+        deleteButton.isHidden = false
+        positionDeleteButton(near: boxView.frame)
+    }
+
+    private func selectBox3D(_ node: SCNNode) {
+        deselectAllBoxes()
+        bboxRenderer.selectBox(node)
+        updateDeleteButtonForSelected3D()
+    }
+
+    private func deselectAllBoxes() {
+        if let idx = selectedBox2DIndex, idx < drawnBoxViews.count {
+            let boxView = drawnBoxViews[idx]
+            boxView.layer.borderColor = UIColor.systemYellow.cgColor
+            boxView.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.15)
+        }
+        selectedBox2DIndex = nil
+        bboxRenderer.deselectAll()
+        deleteButton.isHidden = true
+    }
+
+    private func positionDeleteButton(near rect: CGRect) {
+        deleteButton.center = CGPoint(x: rect.maxX - 2, y: rect.minY + 2)
+        view.bringSubviewToFront(deleteButton)
+    }
+
+    private func updateDeleteButtonForSelected3D() {
+        guard let node = bboxRenderer.selectedNode else {
+            deleteButton.isHidden = true
+            return
+        }
+        let screenPos = sceneView.projectPoint(SCNVector3(node.simdWorldPosition))
+        if screenPos.z > 0 && screenPos.z < 1 {
+            deleteButton.isHidden = false
+            deleteButton.center = CGPoint(
+                x: CGFloat(screenPos.x) + 20,
+                y: CGFloat(screenPos.y) - 20
+            )
+            view.bringSubviewToFront(deleteButton)
+        } else {
+            deleteButton.isHidden = true
+        }
+    }
+
+    @objc private func deleteSelectedBox() {
+        if let idx = selectedBox2DIndex, idx < drawnBoxViews.count {
+            drawnBoxViews[idx].removeFromSuperview()
+            drawnBoxViews.remove(at: idx)
+            drawnBoxCoords.remove(at: idx)
+            selectedBox2DIndex = nil
+            deleteButton.isHidden = true
+            if drawnBoxViews.isEmpty {
+                box2DCaptureData = nil
+                captureButton.isEnabled = false
+                updateStatus("Draw a 2D box around the object, then tap Detect")
+            } else {
+                updateStatus("\(drawnBoxCoords.count) box(es) drawn — draw more or tap Detect")
+            }
+            return
+        }
+
+        if let node = bboxRenderer.selectedNode {
+            bboxRenderer.removeBox(node)
+            deleteButton.isHidden = true
+            updateStatus("\(bboxRenderer.boxCount) 3D box(es) remaining")
         }
     }
 
@@ -745,9 +901,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
 
     @objc private func detectMethodChanged() {
         detectionMethod = detectMethodSegment.selectedSegmentIndex
-        pendingBox2DCapture = nil
-        pendingBox2D = nil
-        hideBoxOverlay()
+        clearDrawnBoxes()
+        deselectAllBoxes()
 
         let isBox = detectionMethod == 1
         panGesture.isEnabled = isBox
