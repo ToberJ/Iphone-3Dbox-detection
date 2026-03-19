@@ -3,11 +3,37 @@ import Foundation
 class DetectionService {
     static let shared = DetectionService()
 
-    var apiUrl = "https://diploidic-describably-anabelle.ngrok-free.dev/detect3d_json"
+    static let modalUrl = "https://hwk18105962347--sam3-3d-api-sam3service-web.modal.run/detect3d_json"
+    static let ngrokUrl = "https://diploidic-describably-anabelle.ngrok-free.dev/detect3d_json"
+
+    var apiUrl = DetectionService.modalUrl
     var textPrompt = "monitor.keyboard.table.chair.computer"
     var scoreThreshold: Float = 0.5
 
+    var isModal: Bool { apiUrl == DetectionService.modalUrl }
+    var isNgrok: Bool { apiUrl == DetectionService.ngrokUrl }
+    var serverName: String {
+        if isModal { return "Modal" }
+        if isNgrok { return "ngrok" }
+        return "Custom"
+    }
+
     private init() {}
+
+    /// Pre-warm the Modal container so the first detection doesn't hit a ~90s cold start.
+    func warmUp() {
+        guard let baseUrl = URL(string: apiUrl)?.deletingLastPathComponent() else { return }
+        let healthUrl = baseUrl.appendingPathComponent("health")
+        print("[DetectionClient] Warming up: \(healthUrl)")
+        URLSession.shared.dataTask(with: healthUrl) { _, response, error in
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if let error = error {
+                print("[DetectionClient] Warm-up failed: \(error.localizedDescription)")
+            } else {
+                print("[DetectionClient] Warm-up response: \(code)")
+            }
+        }.resume()
+    }
 
     func detect(capture: CaptureData) async throws -> DetectionResponse {
         let base64 = capture.pngData.base64EncodedString()
@@ -39,8 +65,7 @@ class DetectionService {
         var request = URLRequest(url: URL(string: apiUrl)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-        request.timeoutInterval = 60
+        request.timeoutInterval = 120
         request.httpBody = jsonData
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -94,7 +119,6 @@ class DetectionService {
         var request = URLRequest(url: URL(string: apiUrl)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         request.timeoutInterval = 120
         request.httpBody = jsonData
 
@@ -158,7 +182,6 @@ class DetectionService {
         var request = URLRequest(url: URL(string: apiUrl)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         request.timeoutInterval = 120
         request.httpBody = jsonData
 
@@ -178,6 +201,51 @@ class DetectionService {
 
         let result = try JSONDecoder().decode(DetectionResponse.self, from: data)
         print("[DetectionClient] Multi-view ref detected \(result.boxes.count) objects, mode=\(result.mode ?? "unknown")")
+        return result
+    }
+    func detectWithBox2D(capture: CaptureData, box2D: [Float]) async throws -> DetectionResponse {
+        print("[DetectionClient] Box2D detect: box=\(box2D)")
+
+        var body: [String: Any] = [
+            "image_base64": capture.pngData.base64EncodedString(),
+            "intrinsic": ["K": capture.intrinsicK],
+            "camera_to_world": ["matrix_4x4": capture.cameraToWorld],
+            "box_2d": box2D,
+            "text_prompt": textPrompt,
+            "score_threshold": scoreThreshold,
+            "source": "iphone"
+        ]
+
+        if let depthData = capture.depthPngData {
+            body["depth_base64"] = depthData.base64EncodedString()
+            body["alignment_post_process"] = capture.alignmentPostProcess
+        }
+
+        let jsonData = try JSONSerialization.data(withJSONObject: body)
+        print("[DetectionClient] Box2D payload: \(jsonData.count / 1024)KB to \(apiUrl)")
+
+        var request = URLRequest(url: URL(string: apiUrl)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = jsonData
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        print("[DetectionClient] Response status: \(statusCode), body size: \(data.count)")
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "no body"
+            print("[DetectionClient] ERROR: \(responseBody)")
+            throw DetectionError.serverError(statusCode: statusCode, message: responseBody)
+        }
+
+        let responseText = String(data: data, encoding: .utf8) ?? ""
+        print("[DetectionClient] Response: \(responseText.prefix(500))")
+
+        let result = try JSONDecoder().decode(DetectionResponse.self, from: data)
+        print("[DetectionClient] Box2D detected \(result.boxes.count) objects, mode=\(result.mode ?? "unknown")")
         return result
     }
 }

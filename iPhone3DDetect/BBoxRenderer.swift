@@ -1,8 +1,15 @@
 import SceneKit
 import simd
 
+struct BoxMetadata {
+    let label: String
+    let score: Float
+    let sizeMeters: simd_float3
+}
+
 class BBoxRenderer {
     private var boxNodes: [SCNNode] = []
+    private var metadata: [SCNNode: BoxMetadata] = [:]
     private weak var scene: SCNScene?
 
     /// Tube radius for wireframe edges (meters). 4mm is visible on iPhone screens.
@@ -12,28 +19,65 @@ class BBoxRenderer {
         self.scene = scene
     }
 
-    func showBoxes(_ boxes: [BBox3D]) {
-        clearBoxes()
+    func addBoxes(_ boxes: [BBox3D]) {
         for box in boxes {
             let node = createBoxNode(box)
             scene?.rootNode.addChildNode(node)
             boxNodes.append(node)
+            metadata[node] = BoxMetadata(
+                label: box.label,
+                score: box.score,
+                sizeMeters: box.sizeSIMD
+            )
         }
     }
 
     func clearBoxes() {
         for node in boxNodes {
             node.removeFromParentNode()
+            metadata.removeValue(forKey: node)
         }
         boxNodes.removeAll()
     }
 
+    var boxCount: Int { boxNodes.count }
+
+    func updateLabels(cameraPosition: simd_float3, useMetric: Bool) {
+        let factor: Float = useMetric ? 1.0 : 3.28084
+        let unit = useMetric ? "m" : "ft"
+
+        for node in boxNodes {
+            guard let meta = metadata[node],
+                  let labelNode = node.childNode(withName: "label", recursively: false),
+                  let textGeom = labelNode.geometry as? SCNText
+            else { continue }
+
+            let dist = simd_distance(cameraPosition, node.simdWorldPosition) * factor
+            let s = meta.sizeMeters * factor
+            let pct = String(format: "%.0f%%", meta.score * 100)
+            let distStr = dist < 10 ? String(format: "%.2f", dist) : String(format: "%.1f", dist)
+
+            let line1 = "\(meta.label) (\(pct)) \(distStr)\(unit)"
+            let line2 = String(format: "%.2f x %.2f x %.2f %@", s.x, s.y, s.z, unit)
+            textGeom.string = "\(line1)\n\(line2)"
+
+            let (bmin, bmax) = textGeom.boundingBox
+            let scale: Float = 0.003
+            let textWidth = Float(bmax.x - bmin.x) * scale
+            labelNode.simdPosition = simd_float3(
+                -textWidth / 2,
+                meta.sizeMeters.y / 2 + 0.05,
+                0
+            )
+        }
+    }
+
+    // MARK: - Node Creation
+
     private func createBoxNode(_ box: BBox3D) -> SCNNode {
         let parentNode = SCNNode()
-        // LH→RH: negate Z of center
         let center = box.centerSIMD
         parentNode.simdWorldPosition = simd_float3(center.x, center.y, -center.z)
-        // LH→RH quaternion (negate ix, iy) + 90° Y rotation (same API quirk as Quest)
         let q = box.quaternion
         let rhQuat = simd_quatf(ix: -q.imag.x, iy: -q.imag.y, iz: q.imag.z, r: q.real)
         parentNode.simdWorldOrientation = rhQuat * simd_quatf(angle: .pi / 2, axis: simd_float3(0, 1, 0))
@@ -43,8 +87,7 @@ class BBoxRenderer {
         let s = box.sizeSIMD
 
         addWireframeEdges(to: parentNode, size: s, color: color)
-        addLabel(to: parentNode, text: "\(box.label) (\(String(format: "%.2f", box.score)))",
-                 boxSize: s, color: color)
+        addLabel(to: parentNode, box: box, boxSize: s, color: color)
 
         return parentNode
     }
@@ -103,19 +146,23 @@ class BBoxRenderer {
         return node
     }
 
-    private func addLabel(to parent: SCNNode, text: String, boxSize: simd_float3, color: UIColor) {
-        let textGeometry = SCNText(string: text, extrusionDepth: 0.5)
+    private func addLabel(to parent: SCNNode, box: BBox3D, boxSize: simd_float3, color: UIColor) {
+        let pct = String(format: "%.0f%%", box.score * 100)
+        let placeholder = "\(box.label) (\(pct))"
+
+        let textGeometry = SCNText(string: placeholder, extrusionDepth: 0.5)
         textGeometry.font = UIFont.systemFont(ofSize: 10, weight: .bold)
         textGeometry.firstMaterial?.diffuse.contents = color
         textGeometry.firstMaterial?.isDoubleSided = true
         textGeometry.flatness = 0.1
 
         let textNode = SCNNode(geometry: textGeometry)
+        textNode.name = "label"
         let scale: Float = 0.003
         textNode.simdScale = simd_float3(scale, scale, scale)
 
-        let (min, max) = textGeometry.boundingBox
-        let textWidth = Float(max.x - min.x) * scale
+        let (bmin, bmax) = textGeometry.boundingBox
+        let textWidth = Float(bmax.x - bmin.x) * scale
         textNode.simdPosition = simd_float3(-textWidth / 2, boxSize.y / 2 + 0.05, 0)
 
         let billboardConstraint = SCNBillboardConstraint()

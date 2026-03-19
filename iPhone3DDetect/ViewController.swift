@@ -20,7 +20,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private var captureSegment: UISegmentedControl!
     private var sendDepth = true
     private var alignmentPostProcess = true
+    private var useMetric = true
     private var captureMode = 0  // 0=Single, 1=Multi-View, 2=Video
+    private var clearButton: UIButton!
     private var videoFrames: [CaptureData] = []
     private var videoTimer: Timer?
     private let videoFrameCount = 15
@@ -28,11 +30,16 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private var multiViewFrames: [CaptureData] = []
     private var multiViewDetectButton: UIButton!
 
+    // 2D box drag
+    private var boxOverlayView: UIView!
+    private var dragStartPoint: CGPoint?
+
     override func viewDidLoad() {
         super.viewDidLoad()
         setupSceneView()
         setupHUD()
         bboxRenderer = BBoxRenderer(scene: sceneView.scene)
+        DetectionService.shared.warmUp()
     }
 
     private var isLiDARAvailable = false
@@ -65,6 +72,18 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         sceneView.session.delegate = self
         sceneView.automaticallyUpdatesLighting = true
         view.addSubview(sceneView)
+
+        let panGesture = UIPanGestureRecognizer(target: self, action: #selector(handleBoxDrag(_:)))
+        panGesture.maximumNumberOfTouches = 1
+        sceneView.addGestureRecognizer(panGesture)
+
+        boxOverlayView = UIView()
+        boxOverlayView.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.15)
+        boxOverlayView.layer.borderColor = UIColor.systemYellow.cgColor
+        boxOverlayView.layer.borderWidth = 2.5
+        boxOverlayView.isHidden = true
+        boxOverlayView.isUserInteractionEnabled = false
+        view.addSubview(boxOverlayView)
     }
 
     // MARK: - HUD
@@ -116,6 +135,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         settingsButton.layer.cornerRadius = 20
         settingsButton.addTarget(self, action: #selector(showSettings), for: .touchUpInside)
         view.addSubview(settingsButton)
+
+        clearButton = UIButton(type: .system)
+        clearButton.translatesAutoresizingMaskIntoConstraints = false
+        clearButton.setImage(UIImage(systemName: "trash.fill"), for: .normal)
+        clearButton.tintColor = .white
+        clearButton.backgroundColor = UIColor.systemRed.withAlphaComponent(0.7)
+        clearButton.layer.cornerRadius = 20
+        clearButton.addTarget(self, action: #selector(clearAllBoxes), for: .touchUpInside)
+        view.addSubview(clearButton)
 
         // Prompt bar for class input
         promptBar = UIView()
@@ -189,6 +217,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             settingsButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             settingsButton.widthAnchor.constraint(equalToConstant: 40),
             settingsButton.heightAnchor.constraint(equalToConstant: 40),
+
+            clearButton.topAnchor.constraint(equalTo: settingsButton.bottomAnchor, constant: 8),
+            clearButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            clearButton.widthAnchor.constraint(equalToConstant: 40),
+            clearButton.heightAnchor.constraint(equalToConstant: 40),
 
             // Status below top bar
             statusLabel.topAnchor.constraint(equalTo: promptBar.bottomAnchor, constant: 8),
@@ -407,7 +440,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
                 return "\(box.label)(\(pct))"
             }.joined(separator: ", ")
             updateStatus("\(modeTag) Found \(result.boxes.count): \(summary)")
-            bboxRenderer.showBoxes(result.boxes)
+            bboxRenderer.addBoxes(result.boxes)
         }
         finishDetection()
     }
@@ -427,6 +460,124 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             flash.alpha = 0
         } completion: { _ in
             flash.removeFromSuperview()
+        }
+    }
+
+    // MARK: - Real-time Label Updates
+
+    func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
+        guard let pov = sceneView.pointOfView else { return }
+        bboxRenderer.updateLabels(cameraPosition: pov.simdWorldPosition, useMetric: useMetric)
+    }
+
+    // MARK: - Clear Boxes
+
+    @objc private func clearAllBoxes() {
+        let count = bboxRenderer.boxCount
+        bboxRenderer.clearBoxes()
+        hideBoxOverlay()
+        updateStatus("\(count) box(es) cleared")
+    }
+
+    // MARK: - 2D Box Drag-to-Detect
+
+    @objc private func handleBoxDrag(_ gesture: UIPanGestureRecognizer) {
+        let location = gesture.location(in: view)
+
+        switch gesture.state {
+        case .began:
+            dragStartPoint = location
+            boxOverlayView.frame = CGRect(origin: location, size: .zero)
+            boxOverlayView.isHidden = false
+            view.bringSubviewToFront(boxOverlayView)
+
+        case .changed:
+            guard let start = dragStartPoint else { return }
+            let rect = CGRect(
+                x: min(start.x, location.x),
+                y: min(start.y, location.y),
+                width: abs(location.x - start.x),
+                height: abs(location.y - start.y)
+            )
+            boxOverlayView.frame = rect
+
+        case .ended, .cancelled:
+            guard let start = dragStartPoint else { return }
+            dragStartPoint = nil
+            let endPoint = location
+
+            let minDrag: CGFloat = 30
+            guard abs(endPoint.x - start.x) > minDrag && abs(endPoint.y - start.y) > minDrag else {
+                boxOverlayView.isHidden = true
+                return
+            }
+
+            captureWithBox2D(screenStart: start, screenEnd: endPoint)
+
+        default:
+            break
+        }
+    }
+
+    private func captureWithBox2D(screenStart: CGPoint, screenEnd: CGPoint) {
+        guard let frame = sceneView.session.currentFrame else { return }
+        guard !isDetecting else { return }
+
+        isDetecting = true
+        flashScreen()
+
+        let captureData = extractCaptureData(from: frame)
+
+        let viewSize = sceneView.bounds.size
+        let dt = frame.displayTransform(for: .landscapeRight, viewportSize: viewSize)
+        let inv = dt.inverted()
+
+        let normStart = CGPoint(x: screenStart.x / viewSize.width, y: screenStart.y / viewSize.height)
+        let normEnd = CGPoint(x: screenEnd.x / viewSize.width, y: screenEnd.y / viewSize.height)
+        let imgStart = normStart.applying(inv)
+        let imgEnd = normEnd.applying(inv)
+
+        let pixelBuffer = frame.capturedImage
+        let origW = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let origH = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        let scale = min(1.0, maxImageDimension / max(origW, origH))
+        let imgW = origW * scale
+        let imgH = origH * scale
+
+        let x1 = Float(min(imgStart.x, imgEnd.x) * imgW)
+        let y1 = Float(min(imgStart.y, imgEnd.y) * imgH)
+        let x2 = Float(max(imgStart.x, imgEnd.x) * imgW)
+        let y2 = Float(max(imgStart.y, imgEnd.y) * imgH)
+        let box2D = [max(0, x1), max(0, y1), min(Float(imgW), x2), min(Float(imgH), y2)]
+
+        print("[Box2D] Screen: (\(Int(screenStart.x)),\(Int(screenStart.y)))->(\(Int(screenEnd.x)),\(Int(screenEnd.y)))")
+        print("[Box2D] Image pixels: [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])] in \(Int(imgW))x\(Int(imgH))")
+
+        updateStatus("Detecting from 2D box...", showSpinner: true)
+
+        Task {
+            do {
+                let result = try await DetectionService.shared.detectWithBox2D(capture: captureData, box2D: box2D)
+                await MainActor.run {
+                    hideBoxOverlay()
+                    handleResult(result)
+                }
+            } catch {
+                await MainActor.run {
+                    hideBoxOverlay()
+                    updateStatus("Error: \(error.localizedDescription)")
+                    finishDetection()
+                }
+            }
+        }
+    }
+
+    private func hideBoxOverlay() {
+        UIView.animate(withDuration: 0.3) {
+            self.boxOverlayView.alpha = 0
+        } completion: { _ in
+            self.boxOverlayView.isHidden = true
+            self.boxOverlayView.alpha = 1
         }
     }
 
@@ -580,33 +731,51 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     // MARK: - Settings
 
     @objc private func showSettings() {
-        let alert = UIAlertController(title: "Settings", message: nil, preferredStyle: .alert)
+        let ds = DetectionService.shared
+        let unitLabel = useMetric ? "Units: Meters → Feet" : "Units: Feet → Meters"
+        let serverLabel = "Server: \(ds.serverName)"
+
+        let alert = UIAlertController(title: "Settings", message: serverLabel, preferredStyle: .alert)
 
         alert.addTextField { tf in
-            tf.text = DetectionService.shared.apiUrl
-            tf.placeholder = "API URL"
-            tf.font = .systemFont(ofSize: 12)
-        }
-        alert.addTextField { tf in
-            tf.text = String(DetectionService.shared.scoreThreshold)
+            tf.text = String(ds.scoreThreshold)
             tf.placeholder = "Score threshold (0.0 - 1.0)"
             tf.keyboardType = .decimalPad
         }
 
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Save", style: .default) { _ in
-            if let url = alert.textFields?[0].text, !url.isEmpty {
-                DetectionService.shared.apiUrl = url
+            if let threshStr = alert.textFields?[0].text, let thresh = Float(threshStr) {
+                ds.scoreThreshold = max(0, min(1, thresh))
             }
-            if let threshStr = alert.textFields?[1].text, let thresh = Float(threshStr) {
-                DetectionService.shared.scoreThreshold = max(0, min(1, thresh))
-            }
+        })
+
+        alert.addAction(UIAlertAction(title: "Switch to Modal", style: .default) { [weak self] _ in
+            ds.apiUrl = DetectionService.modalUrl
+            ds.warmUp()
+            self?.updateStatus("Server: Modal")
+            print("[Settings] Switched to Modal")
+        })
+
+        alert.addAction(UIAlertAction(title: "Switch to ngrok", style: .default) { [weak self] _ in
+            ds.apiUrl = DetectionService.ngrokUrl
+            self?.updateStatus("Server: ngrok")
+            print("[Settings] Switched to ngrok")
+        })
+
+        alert.addAction(UIAlertAction(title: unitLabel, style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            self.useMetric.toggle()
+            let newUnit = self.useMetric ? "Meters" : "Feet"
+            self.updateStatus("Units: \(newUnit)")
+            print("[Settings] Units switched to \(newUnit)")
         })
 
         alert.addAction(UIAlertAction(title: "Clear Boxes", style: .destructive) { [weak self] _ in
             self?.bboxRenderer.clearBoxes()
             self?.updateStatus("Boxes cleared")
         })
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
         present(alert, animated: true)
     }
