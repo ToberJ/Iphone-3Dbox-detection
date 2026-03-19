@@ -30,9 +30,16 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private var multiViewFrames: [CaptureData] = []
     private var multiViewDetectButton: UIButton!
 
+    // Detection method: 0=Classes, 1=2D Box
+    private var detectionMethod = 0
+    private var detectMethodSegment: UISegmentedControl!
+    private var panGesture: UIPanGestureRecognizer!
+
     // 2D box drag
     private var boxOverlayView: UIView!
     private var dragStartPoint: CGPoint?
+    private var pendingBox2DCapture: CaptureData?
+    private var pendingBox2D: [Float]?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -73,8 +80,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         sceneView.automaticallyUpdatesLighting = true
         view.addSubview(sceneView)
 
-        let panGesture = UIPanGestureRecognizer(target: self, action: #selector(handleBoxDrag(_:)))
+        panGesture = UIPanGestureRecognizer(target: self, action: #selector(handleBoxDrag(_:)))
         panGesture.maximumNumberOfTouches = 1
+        panGesture.isEnabled = false
         sceneView.addGestureRecognizer(panGesture)
 
         boxOverlayView = UIView()
@@ -185,6 +193,16 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         modeSegment.addTarget(self, action: #selector(modeChanged), for: .valueChanged)
         view.addSubview(modeSegment)
 
+        detectMethodSegment = UISegmentedControl(items: ["Classes", "2D Box"])
+        detectMethodSegment.translatesAutoresizingMaskIntoConstraints = false
+        detectMethodSegment.selectedSegmentIndex = 0
+        detectMethodSegment.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        detectMethodSegment.selectedSegmentTintColor = UIColor.systemPurple
+        detectMethodSegment.setTitleTextAttributes([.foregroundColor: UIColor.lightGray, .font: UIFont.systemFont(ofSize: 13, weight: .medium)], for: .normal)
+        detectMethodSegment.setTitleTextAttributes([.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 13, weight: .bold)], for: .selected)
+        detectMethodSegment.addTarget(self, action: #selector(detectMethodChanged), for: .valueChanged)
+        view.addSubview(detectMethodSegment)
+
         captureSegment = UISegmentedControl(items: ["Single", "Multi-View", "Video"])
         captureSegment.translatesAutoresizingMaskIntoConstraints = false
         captureSegment.selectedSegmentIndex = 0
@@ -231,9 +249,13 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             activityIndicator.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
             activityIndicator.trailingAnchor.constraint(equalTo: statusLabel.leadingAnchor, constant: -8),
 
-            // Bottom row: capture segment (left) + detect button (right)
+            // Bottom row: detect method + capture segment (left) + detect button (right)
+            detectMethodSegment.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18),
+            detectMethodSegment.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            detectMethodSegment.heightAnchor.constraint(equalToConstant: 32),
+
             captureSegment.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18),
-            captureSegment.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            captureSegment.leadingAnchor.constraint(equalTo: detectMethodSegment.trailingAnchor, constant: 12),
             captureSegment.heightAnchor.constraint(equalToConstant: 32),
 
             captureButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
@@ -262,6 +284,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     // MARK: - Capture & Detect
 
     @objc private func captureAndDetect() {
+        if detectionMethod == 1 {
+            sendPendingBox2D()
+            return
+        }
+
         // Multi-view allows tapping again while "detecting" (collecting frames)
         if captureMode == 1 && !multiViewFrames.isEmpty {
             captureMultiViewFrame()
@@ -447,8 +474,17 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
 
     private func finishDetection() {
         isDetecting = false
-        captureButton.isEnabled = true
-        resetCaptureButton()
+        if detectionMethod == 1 {
+            captureButton.setTitle("  Detect  ", for: .normal)
+            captureButton.backgroundColor = UIColor.systemBlue
+            captureButton.isEnabled = pendingBox2D != nil
+            if pendingBox2D == nil {
+                updateStatus("Draw a 2D box around the object, then tap Detect")
+            }
+        } else {
+            captureButton.isEnabled = true
+            resetCaptureButton()
+        }
     }
 
     private func flashScreen() {
@@ -512,18 +548,16 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
                 return
             }
 
-            captureWithBox2D(screenStart: start, screenEnd: endPoint)
+            storeBox2DCapture(screenStart: start, screenEnd: endPoint)
 
         default:
             break
         }
     }
 
-    private func captureWithBox2D(screenStart: CGPoint, screenEnd: CGPoint) {
+    /// Capture current frame and compute box2D pixel coordinates, but don't send yet.
+    private func storeBox2DCapture(screenStart: CGPoint, screenEnd: CGPoint) {
         guard let frame = sceneView.session.currentFrame else { return }
-        guard !isDetecting else { return }
-
-        isDetecting = true
         flashScreen()
 
         let captureData = extractCaptureData(from: frame)
@@ -550,21 +584,38 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         let y2 = Float(max(imgStart.y, imgEnd.y) * imgH)
         let box2D = [max(0, x1), max(0, y1), min(Float(imgW), x2), min(Float(imgH), y2)]
 
-        print("[Box2D] Screen: (\(Int(screenStart.x)),\(Int(screenStart.y)))->(\(Int(screenEnd.x)),\(Int(screenEnd.y)))")
-        print("[Box2D] Image pixels: [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])] in \(Int(imgW))x\(Int(imgH))")
+        pendingBox2DCapture = captureData
+        pendingBox2D = box2D
+        captureButton.isEnabled = true
 
+        print("[Box2D] Stored: [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])] in \(Int(imgW))x\(Int(imgH))")
+        updateStatus("2D box ready — tap Detect to send, or redraw")
+    }
+
+    private func sendPendingBox2D() {
+        guard let capture = pendingBox2DCapture, let box2D = pendingBox2D else { return }
+        guard !isDetecting else { return }
+
+        isDetecting = true
+        captureButton.isEnabled = false
         updateStatus("Detecting from 2D box...", showSpinner: true)
+
+        print("[Box2D] Sending: [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])]")
 
         Task {
             do {
-                let result = try await DetectionService.shared.detectWithBox2D(capture: captureData, box2D: box2D)
+                let result = try await DetectionService.shared.detectWithBox2D(capture: capture, box2D: box2D)
                 await MainActor.run {
                     hideBoxOverlay()
+                    pendingBox2DCapture = nil
+                    pendingBox2D = nil
                     handleResult(result)
                 }
             } catch {
                 await MainActor.run {
                     hideBoxOverlay()
+                    pendingBox2DCapture = nil
+                    pendingBox2D = nil
                     updateStatus("Error: \(error.localizedDescription)")
                     finishDetection()
                 }
@@ -688,6 +739,34 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             guard CGImageDestinationFinalize(dest) else { return nil }
             return mutableData as Data
         }
+    }
+
+    // MARK: - Detection Method Toggle
+
+    @objc private func detectMethodChanged() {
+        detectionMethod = detectMethodSegment.selectedSegmentIndex
+        pendingBox2DCapture = nil
+        pendingBox2D = nil
+        hideBoxOverlay()
+
+        let isBox = detectionMethod == 1
+        panGesture.isEnabled = isBox
+        promptBar.isHidden = isBox
+        captureSegment.isHidden = isBox
+        multiViewDetectButton.isHidden = true
+        multiViewFrames = []
+
+        if isBox {
+            captureButton.setTitle("  Detect  ", for: .normal)
+            captureButton.backgroundColor = UIColor.systemBlue
+            captureButton.isEnabled = false
+            updateStatus("Draw a 2D box around the object, then tap Detect")
+        } else {
+            resetCaptureButton()
+            captureButton.isEnabled = true
+            updateStatus("Ready - Tap Detect")
+        }
+        print("[DetectMethod] \(isBox ? "2D Box" : "Classes")")
     }
 
     // MARK: - Capture Mode Toggle
