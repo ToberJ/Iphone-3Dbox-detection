@@ -121,26 +121,18 @@ class BBoxRenderer {
     }
 
     func updateLabels(cameraPosition: simd_float3, useMetric: Bool) {
-        let factor: Float = useMetric ? 1.0 : 3.28084
-        let unit = useMetric ? "m" : "ft"
-
+        let scale: Float = 0.003
         for node in boxNodes {
             guard let meta = metadata[node],
                   let labelNode = node.childNode(withName: "label", recursively: false),
                   let textGeom = labelNode.geometry as? SCNText
             else { continue }
 
-            let dist = simd_distance(cameraPosition, node.simdWorldPosition) * factor
-            let s = meta.sizeMeters * factor
             let pct = String(format: "%.0f%%", meta.score * 100)
-            let distStr = dist < 10 ? String(format: "%.2f", dist) : String(format: "%.1f", dist)
+            textGeom.string = "\(meta.label) (\(pct))"
 
-            let line1 = "\(meta.label) (\(pct)) \(distStr)\(unit)"
-            let line2 = String(format: "%.2f x %.2f x %.2f %@", s.x, s.y, s.z, unit)
-            textGeom.string = "\(line1)\n\(line2)"
-
+            labelNode.simdScale = simd_float3(scale, scale, scale)
             let (bmin, bmax) = textGeom.boundingBox
-            let scale: Float = 0.003
             let textWidth = Float(bmax.x - bmin.x) * scale
             labelNode.simdPosition = simd_float3(
                 -textWidth / 2,
@@ -148,6 +140,18 @@ class BBoxRenderer {
                 0
             )
         }
+    }
+
+    /// Formatted caption string for a selected box (shown in screen-space overlay).
+    func captionText(for node: SCNNode, cameraPosition: simd_float3, useMetric: Bool) -> String? {
+        guard let meta = metadata[node] else { return nil }
+        let factor: Float = useMetric ? 1.0 : 3.28084
+        let unit = useMetric ? "m" : "ft"
+        let dist = simd_distance(cameraPosition, node.simdWorldPosition) * factor
+        let s = meta.sizeMeters * factor
+        let pct = String(format: "%.0f%%", meta.score * 100)
+        let distStr = dist < 10 ? String(format: "%.2f", dist) : String(format: "%.1f", dist)
+        return "\(meta.label) (\(pct))  |  Distance: \(distStr)\(unit)  |  \(String(format: "%.2f × %.2f × %.2f", s.x, s.y, s.z)) \(unit)"
     }
 
     // MARK: - Node Creation

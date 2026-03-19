@@ -2,8 +2,9 @@ import UIKit
 import ARKit
 import SceneKit
 import ImageIO
+import PhotosUI
 
-class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UITextFieldDelegate {
+class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PHPickerViewControllerDelegate {
 
     private var sceneView: ARSCNView!
     private var bboxRenderer: BBoxRenderer!
@@ -14,9 +15,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private var captureButton: UIButton!
     private var activityIndicator: UIActivityIndicatorView!
     private var settingsButton: UIButton!
-    private var promptTextField: UITextField!
     private var promptBar: UIView!
+    private var chipsScrollView: UIScrollView!
+    private var chipsStack: UIStackView!
     private var modeSegment: UISegmentedControl!
+    private var captionLabel: UILabel!
+
+    // Class management (persisted)
+    private var savedClasses: [String] = []
+    private var activeClasses: Set<String> = []
     private var captureSegment: UISegmentedControl!
     private var sendDepth = true
     private var alignmentPostProcess = true
@@ -45,10 +52,21 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     private var selectedBox2DIndex: Int?
     private var deleteButton: UIButton!
 
+    // Input mode: 0=Camera, 1=Upload
+    private var inputMode = 0
+    private var inputModeSegment: UISegmentedControl!
+    private var uploadImageView: UIImageView!
+    private var uploadedImage: UIImage?
+    private var saveButton: UIButton!
+    private var pickPhotoButton: UIButton!
+    private var changePhotoButton: UIButton!
+
     override func viewDidLoad() {
         super.viewDidLoad()
         setupSceneView()
         setupHUD()
+        loadClasses()
+        rebuildChips()
         bboxRenderer = BBoxRenderer(scene: sceneView.scene)
         DetectionService.shared.warmUp()
     }
@@ -57,6 +75,17 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        if inputMode == 0 {
+            startARSession()
+        }
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        sceneView.session.pause()
+    }
+
+    private func startARSession() {
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = []
         isLiDARAvailable = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
@@ -69,11 +98,6 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         sceneView.session.run(config)
     }
 
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        sceneView.session.pause()
-    }
-
     // MARK: - Scene View
 
     private func setupSceneView() {
@@ -84,13 +108,21 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         sceneView.automaticallyUpdatesLighting = true
         view.addSubview(sceneView)
 
+        uploadImageView = UIImageView(frame: view.bounds)
+        uploadImageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        uploadImageView.contentMode = .scaleAspectFit
+        uploadImageView.backgroundColor = .black
+        uploadImageView.isHidden = true
+        uploadImageView.isUserInteractionEnabled = true
+        view.addSubview(uploadImageView)
+
         panGesture = UIPanGestureRecognizer(target: self, action: #selector(handleBoxDrag(_:)))
         panGesture.maximumNumberOfTouches = 1
         panGesture.isEnabled = false
-        sceneView.addGestureRecognizer(panGesture)
+        view.addGestureRecognizer(panGesture)
 
         let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
-        sceneView.addGestureRecognizer(tapGesture)
+        view.addGestureRecognizer(tapGesture)
     }
 
     // MARK: - HUD
@@ -152,6 +184,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         clearButton.addTarget(self, action: #selector(clearAllBoxes), for: .touchUpInside)
         view.addSubview(clearButton)
 
+        saveButton = UIButton(type: .system)
+        saveButton.translatesAutoresizingMaskIntoConstraints = false
+        saveButton.setImage(UIImage(systemName: "square.and.arrow.down.fill"), for: .normal)
+        saveButton.tintColor = .white
+        saveButton.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.7)
+        saveButton.layer.cornerRadius = 20
+        saveButton.addTarget(self, action: #selector(saveCurrentFrame), for: .touchUpInside)
+        view.addSubview(saveButton)
+
         deleteButton = UIButton(type: .system)
         deleteButton.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
         deleteButton.tintColor = .white
@@ -162,35 +203,64 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         deleteButton.isHidden = true
         view.addSubview(deleteButton)
 
-        // Prompt bar for class input
+        pickPhotoButton = UIButton(type: .system)
+        pickPhotoButton.translatesAutoresizingMaskIntoConstraints = false
+        pickPhotoButton.setTitle("  Upload Image  ", for: .normal)
+        pickPhotoButton.setImage(UIImage(systemName: "photo.on.rectangle.angled"), for: .normal)
+        pickPhotoButton.tintColor = UIColor.darkGray
+        pickPhotoButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .semibold)
+        pickPhotoButton.setTitleColor(UIColor.darkGray, for: .normal)
+        pickPhotoButton.backgroundColor = .white
+        pickPhotoButton.layer.cornerRadius = 16
+        pickPhotoButton.layer.shadowColor = UIColor.black.cgColor
+        pickPhotoButton.layer.shadowOpacity = 0.3
+        pickPhotoButton.layer.shadowOffset = CGSize(width: 0, height: 2)
+        pickPhotoButton.layer.shadowRadius = 4
+        pickPhotoButton.addTarget(self, action: #selector(pickPhotoTapped), for: .touchUpInside)
+        pickPhotoButton.isHidden = true
+        view.addSubview(pickPhotoButton)
+
+        changePhotoButton = UIButton(type: .system)
+        changePhotoButton.translatesAutoresizingMaskIntoConstraints = false
+        changePhotoButton.setImage(UIImage(systemName: "arrow.triangle.2.circlepath.camera.fill"), for: .normal)
+        changePhotoButton.tintColor = .white
+        changePhotoButton.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.8)
+        changePhotoButton.layer.cornerRadius = 20
+        changePhotoButton.addTarget(self, action: #selector(pickPhotoTapped), for: .touchUpInside)
+        changePhotoButton.isHidden = true
+        view.addSubview(changePhotoButton)
+
+        // Prompt bar with class chips
         promptBar = UIView()
         promptBar.translatesAutoresizingMaskIntoConstraints = false
         promptBar.backgroundColor = UIColor.black.withAlphaComponent(0.75)
         promptBar.layer.cornerRadius = 12
+        promptBar.clipsToBounds = true
         view.addSubview(promptBar)
 
-        let promptLabel = UILabel()
-        promptLabel.translatesAutoresizingMaskIntoConstraints = false
-        promptLabel.text = "Classes:"
-        promptLabel.textColor = .lightGray
-        promptLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        promptBar.addSubview(promptLabel)
+        chipsScrollView = UIScrollView()
+        chipsScrollView.translatesAutoresizingMaskIntoConstraints = false
+        chipsScrollView.showsHorizontalScrollIndicator = false
+        promptBar.addSubview(chipsScrollView)
 
-        promptTextField = UITextField()
-        promptTextField.translatesAutoresizingMaskIntoConstraints = false
-        promptTextField.text = DetectionService.shared.textPrompt
-        promptTextField.textColor = .white
-        promptTextField.font = .systemFont(ofSize: 14)
-        promptTextField.returnKeyType = .done
-        promptTextField.autocorrectionType = .no
-        promptTextField.autocapitalizationType = .none
-        promptTextField.attributedPlaceholder = NSAttributedString(
-            string: "e.g. monitor.keyboard.chair",
-            attributes: [.foregroundColor: UIColor.gray]
-        )
-        promptTextField.addTarget(self, action: #selector(promptChanged), for: .editingDidEnd)
-        promptTextField.delegate = self
-        promptBar.addSubview(promptTextField)
+        chipsStack = UIStackView()
+        chipsStack.translatesAutoresizingMaskIntoConstraints = false
+        chipsStack.axis = .horizontal
+        chipsStack.spacing = 6
+        chipsStack.alignment = .center
+        chipsScrollView.addSubview(chipsStack)
+
+        // Caption bar for selected box info
+        captionLabel = UILabel()
+        captionLabel.translatesAutoresizingMaskIntoConstraints = false
+        captionLabel.textColor = .white
+        captionLabel.backgroundColor = UIColor.black.withAlphaComponent(0.75)
+        captionLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        captionLabel.textAlignment = .center
+        captionLabel.layer.cornerRadius = 10
+        captionLabel.clipsToBounds = true
+        captionLabel.isHidden = true
+        view.addSubview(captionLabel)
 
         modeSegment = UISegmentedControl(items: ["RGB", "RGBD", "RGBD+SAM2"])
         modeSegment.translatesAutoresizingMaskIntoConstraints = false
@@ -212,6 +282,17 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         detectMethodSegment.addTarget(self, action: #selector(detectMethodChanged), for: .valueChanged)
         view.addSubview(detectMethodSegment)
 
+        inputModeSegment = UISegmentedControl(items: ["Camera", "Upload"])
+        inputModeSegment.translatesAutoresizingMaskIntoConstraints = false
+        inputModeSegment.selectedSegmentIndex = 0
+        inputModeSegment.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        inputModeSegment.selectedSegmentTintColor = UIColor.systemOrange
+        inputModeSegment.setTitleTextAttributes([.foregroundColor: UIColor.lightGray, .font: UIFont.systemFont(ofSize: 13, weight: .medium)], for: .normal)
+        inputModeSegment.setTitleTextAttributes([.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 13, weight: .bold)], for: .selected)
+        inputModeSegment.addTarget(self, action: #selector(inputModeChanged), for: .valueChanged)
+        view.addSubview(inputModeSegment)
+
+        // Multi-View and Video modes disabled for now; code kept for future use
         captureSegment = UISegmentedControl(items: ["Single", "Multi-View", "Video"])
         captureSegment.translatesAutoresizingMaskIntoConstraints = false
         captureSegment.selectedSegmentIndex = 0
@@ -220,6 +301,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         captureSegment.setTitleTextAttributes([.foregroundColor: UIColor.lightGray, .font: UIFont.systemFont(ofSize: 13, weight: .medium)], for: .normal)
         captureSegment.setTitleTextAttributes([.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 13, weight: .bold)], for: .selected)
         captureSegment.addTarget(self, action: #selector(captureSegmentChanged), for: .valueChanged)
+        captureSegment.isHidden = true
         view.addSubview(captureSegment)
 
         NSLayoutConstraint.activate([
@@ -229,12 +311,16 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             promptBar.trailingAnchor.constraint(equalTo: modeSegment.leadingAnchor, constant: -8),
             promptBar.heightAnchor.constraint(equalToConstant: 40),
 
-            promptLabel.leadingAnchor.constraint(equalTo: promptBar.leadingAnchor, constant: 12),
-            promptLabel.centerYAnchor.constraint(equalTo: promptBar.centerYAnchor),
+            chipsScrollView.topAnchor.constraint(equalTo: promptBar.topAnchor),
+            chipsScrollView.bottomAnchor.constraint(equalTo: promptBar.bottomAnchor),
+            chipsScrollView.leadingAnchor.constraint(equalTo: promptBar.leadingAnchor, constant: 6),
+            chipsScrollView.trailingAnchor.constraint(equalTo: promptBar.trailingAnchor, constant: -6),
 
-            promptTextField.leadingAnchor.constraint(equalTo: promptLabel.trailingAnchor, constant: 8),
-            promptTextField.trailingAnchor.constraint(equalTo: promptBar.trailingAnchor, constant: -12),
-            promptTextField.centerYAnchor.constraint(equalTo: promptBar.centerYAnchor),
+            chipsStack.topAnchor.constraint(equalTo: chipsScrollView.topAnchor),
+            chipsStack.bottomAnchor.constraint(equalTo: chipsScrollView.bottomAnchor),
+            chipsStack.leadingAnchor.constraint(equalTo: chipsScrollView.leadingAnchor),
+            chipsStack.trailingAnchor.constraint(equalTo: chipsScrollView.trailingAnchor),
+            chipsStack.heightAnchor.constraint(equalTo: chipsScrollView.heightAnchor),
 
             modeSegment.centerYAnchor.constraint(equalTo: promptBar.centerYAnchor),
             modeSegment.trailingAnchor.constraint(equalTo: settingsButton.leadingAnchor, constant: -8),
@@ -250,6 +336,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             clearButton.widthAnchor.constraint(equalToConstant: 40),
             clearButton.heightAnchor.constraint(equalToConstant: 40),
 
+            saveButton.topAnchor.constraint(equalTo: clearButton.bottomAnchor, constant: 8),
+            saveButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            saveButton.widthAnchor.constraint(equalToConstant: 40),
+            saveButton.heightAnchor.constraint(equalToConstant: 40),
+
             // Status below top bar
             statusLabel.topAnchor.constraint(equalTo: promptBar.bottomAnchor, constant: 8),
             statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -258,9 +349,18 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             activityIndicator.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
             activityIndicator.trailingAnchor.constraint(equalTo: statusLabel.leadingAnchor, constant: -8),
 
-            // Bottom row: detect method + capture segment (left) + detect button (right)
+            // Caption for selected box — aligned with bottom row
+            captionLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            captionLabel.centerYAnchor.constraint(equalTo: detectMethodSegment.centerYAnchor),
+            captionLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 28),
+
+            // Bottom row: input mode + detect method + capture segment (left) + buttons (right)
+            inputModeSegment.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18),
+            inputModeSegment.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            inputModeSegment.heightAnchor.constraint(equalToConstant: 32),
+
             detectMethodSegment.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18),
-            detectMethodSegment.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            detectMethodSegment.leadingAnchor.constraint(equalTo: inputModeSegment.trailingAnchor, constant: 8),
             detectMethodSegment.heightAnchor.constraint(equalToConstant: 32),
 
             captureSegment.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18),
@@ -271,6 +371,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             captureButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
             captureButton.widthAnchor.constraint(equalToConstant: 120),
             captureButton.heightAnchor.constraint(equalToConstant: 50),
+
+            pickPhotoButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            pickPhotoButton.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            pickPhotoButton.heightAnchor.constraint(equalToConstant: 56),
+
+            changePhotoButton.topAnchor.constraint(equalTo: saveButton.bottomAnchor, constant: 8),
+            changePhotoButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            changePhotoButton.widthAnchor.constraint(equalToConstant: 40),
+            changePhotoButton.heightAnchor.constraint(equalToConstant: 40),
 
             multiViewDetectButton.bottomAnchor.constraint(equalTo: captureButton.bottomAnchor),
             multiViewDetectButton.trailingAnchor.constraint(equalTo: captureButton.leadingAnchor, constant: -12),
@@ -290,9 +399,159 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         }
     }
 
+    // MARK: - Input Mode Toggle
+
+    @objc private func inputModeChanged() {
+        inputMode = inputModeSegment.selectedSegmentIndex
+        clearDrawnBoxes()
+        deselectAllBoxes()
+        bboxRenderer.clearBoxes()
+
+        if inputMode == 0 {
+            // Camera mode
+            uploadImageView.isHidden = true
+            uploadedImage = nil
+            uploadImageView.image = nil
+            pickPhotoButton.isHidden = true
+            changePhotoButton.isHidden = true
+            modeSegment.isHidden = false
+            startARSession()
+
+            if detectionMethod == 0 {
+                resetCaptureButton()
+                captureButton.isEnabled = true
+                updateStatus("Ready - Tap Detect")
+            } else {
+                captureButton.setTitle("  Detect  ", for: .normal)
+                captureButton.backgroundColor = .systemBlue
+                captureButton.isEnabled = false
+                updateStatus("Draw a 2D box around the object, then tap Detect")
+            }
+        } else {
+            // Upload mode
+            sceneView.session.pause()
+            uploadImageView.isHidden = false
+            pickPhotoButton.isHidden = false
+            modeSegment.isHidden = true
+
+            captureButton.setTitle("  Detect  ", for: .normal)
+            captureButton.backgroundColor = .systemBlue
+            captureButton.isEnabled = false
+
+            if detectionMethod == 1 {
+                updateStatus("Select a photo, then draw 2D boxes")
+            } else {
+                updateStatus("Select a photo to detect")
+            }
+        }
+        print("[InputMode] \(inputMode == 0 ? "Camera" : "Upload")")
+    }
+
+    // MARK: - Photo Picker
+
+    @objc private func pickPhotoTapped() {
+        pickPhoto()
+    }
+
+    private func pickPhoto() {
+        var config = PHPickerConfiguration()
+        config.selectionLimit = 1
+        config.filter = .images
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = self
+        present(picker, animated: true)
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        guard let result = results.first else { return }
+
+        result.itemProvider.loadObject(ofClass: UIImage.self) { [weak self] object, error in
+            guard let self = self, let image = object as? UIImage else { return }
+            let normalized = self.normalizeOrientation(image)
+            DispatchQueue.main.async {
+                self.uploadedImage = normalized
+                self.uploadImageView.image = normalized
+                self.pickPhotoButton.isHidden = true
+                self.changePhotoButton.isHidden = false
+                self.clearDrawnBoxes()
+
+                if self.detectionMethod == 1 {
+                    self.captureButton.isEnabled = false
+                    self.updateStatus("Photo loaded - draw 2D boxes, then tap Detect")
+                } else {
+                    self.captureButton.isEnabled = true
+                    self.updateStatus("Photo loaded - tap Detect")
+                }
+            }
+        }
+    }
+
+    private func normalizeOrientation(_ image: UIImage) -> UIImage {
+        guard image.imageOrientation != .up else { return image }
+        let renderer = UIGraphicsImageRenderer(size: image.size)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: image.size))
+        }
+    }
+
+    // MARK: - Save to Photos
+
+    @objc private func saveCurrentFrame() {
+        if inputMode == 0 {
+            let image = sceneView.snapshot()
+            UIImageWriteToSavedPhotosAlbum(image, self, #selector(saveCompleted(_:didFinishSavingWithError:contextInfo:)), nil)
+        } else {
+            guard let image = uploadedImage else {
+                updateStatus("No image to save")
+                return
+            }
+            UIImageWriteToSavedPhotosAlbum(image, self, #selector(saveCompleted(_:didFinishSavingWithError:contextInfo:)), nil)
+        }
+    }
+
+    @objc private func saveCompleted(_ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer) {
+        if let error = error {
+            updateStatus("Save failed: \(error.localizedDescription)")
+        } else {
+            updateStatus("Saved to Photos")
+        }
+    }
+
     // MARK: - Capture & Detect
 
     @objc private func captureAndDetect() {
+        // Upload mode
+        if inputMode == 1 {
+            guard let image = uploadedImage else {
+                pickPhoto()
+                return
+            }
+            if detectionMethod == 1 {
+                sendAllBox2D()
+                return
+            }
+            guard !isDetecting else { return }
+            isDetecting = true
+            captureButton.isEnabled = false
+            updateStatus("Detecting objects...", showSpinner: true)
+
+            let captureData = extractCaptureDataFromUpload(image: image)
+            Task {
+                do {
+                    let result = try await DetectionService.shared.detect(capture: captureData)
+                    await MainActor.run { handleResult(result) }
+                } catch {
+                    await MainActor.run {
+                        updateStatus("Error: \(error.localizedDescription)")
+                        finishDetection()
+                    }
+                }
+            }
+            return
+        }
+
+        // Camera mode
         if detectionMethod == 1 {
             sendAllBox2D()
             return
@@ -476,13 +735,34 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
                 return "\(box.label)(\(pct))"
             }.joined(separator: ", ")
             updateStatus("\(modeTag) Found \(result.boxes.count): \(summary)")
-            bboxRenderer.addBoxes(result.boxes)
+            if inputMode == 0 {
+                bboxRenderer.addBoxes(result.boxes)
+            }
         }
         finishDetection()
     }
 
     private func finishDetection() {
         isDetecting = false
+
+        if inputMode == 1 {
+            // Upload mode
+            if detectionMethod == 1 {
+                captureButton.setTitle("  Detect  ", for: .normal)
+                captureButton.backgroundColor = .systemBlue
+                captureButton.isEnabled = !drawnBoxCoords.isEmpty
+                if drawnBoxCoords.isEmpty && uploadedImage != nil {
+                    updateStatus("Draw a 2D box around the object, then tap Detect")
+                }
+            } else {
+                captureButton.setTitle("  Detect  ", for: .normal)
+                captureButton.backgroundColor = .systemBlue
+                captureButton.isEnabled = uploadedImage != nil
+            }
+            return
+        }
+
+        // Camera mode
         if detectionMethod == 1 {
             captureButton.setTitle("  Detect  ", for: .normal)
             captureButton.backgroundColor = UIColor.systemBlue
@@ -511,12 +791,18 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     // MARK: - Real-time Label Updates
 
     func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
+        guard inputMode == 0 else { return }
         guard let pov = sceneView.pointOfView else { return }
         bboxRenderer.updateLabels(cameraPosition: pov.simdWorldPosition, useMetric: useMetric)
 
-        if bboxRenderer.selectedNode != nil {
+        if let selected = bboxRenderer.selectedNode {
             DispatchQueue.main.async { [weak self] in
-                self?.updateDeleteButtonForSelected3D()
+                guard let self = self else { return }
+                self.updateDeleteButtonForSelected3D()
+                if let text = self.bboxRenderer.captionText(for: selected, cameraPosition: pov.simdWorldPosition, useMetric: self.useMetric) {
+                    self.captionLabel.text = "  \(text)  "
+                    self.captionLabel.isHidden = false
+                }
             }
         }
     }
@@ -563,7 +849,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             dragStartPoint = nil
             let endPoint = location
 
-            let minDrag: CGFloat = 30
+            let minDrag: CGFloat = 8
             if abs(endPoint.x - start.x) < minDrag || abs(endPoint.y - start.y) < minDrag {
                 drawnBoxViews.last?.removeFromSuperview()
                 drawnBoxViews.removeLast()
@@ -587,6 +873,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
     }
 
     private func storeBox2DCoords(screenStart: CGPoint, screenEnd: CGPoint) {
+        if inputMode == 1 {
+            storeBox2DCoordsUpload(screenStart: screenStart, screenEnd: screenEnd)
+            return
+        }
+
         guard let frame = sceneView.session.currentFrame else { return }
 
         if box2DCaptureData == nil {
@@ -621,6 +912,55 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
 
         print("[Box2D] Stored box #\(drawnBoxCoords.count): [\(box2D[0]), \(box2D[1]), \(box2D[2]), \(box2D[3])] in \(Int(imgW))x\(Int(imgH))")
         updateStatus("\(drawnBoxCoords.count) box(es) drawn — draw more or tap Detect")
+    }
+
+    private func storeBox2DCoordsUpload(screenStart: CGPoint, screenEnd: CGPoint) {
+        guard let image = uploadedImage else { return }
+
+        if box2DCaptureData == nil {
+            flashScreen()
+            box2DCaptureData = extractCaptureDataFromUpload(image: image)
+        }
+
+        let displayRect = imageDisplayRect()
+
+        let normStartX = (screenStart.x - displayRect.origin.x) / displayRect.width
+        let normStartY = (screenStart.y - displayRect.origin.y) / displayRect.height
+        let normEndX = (screenEnd.x - displayRect.origin.x) / displayRect.width
+        let normEndY = (screenEnd.y - displayRect.origin.y) / displayRect.height
+
+        let origW = image.size.width
+        let origH = image.size.height
+        let scale = min(1.0, maxImageDimension / max(origW, origH))
+        let imgW = origW * scale
+        let imgH = origH * scale
+
+        let x1 = Float(min(normStartX, normEndX) * imgW)
+        let y1 = Float(min(normStartY, normEndY) * imgH)
+        let x2 = Float(max(normStartX, normEndX) * imgW)
+        let y2 = Float(max(normStartY, normEndY) * imgH)
+        let box2D = [max(0, x1), max(0, y1), min(Float(imgW), x2), min(Float(imgH), y2)]
+
+        drawnBoxCoords.append(box2D)
+        captureButton.isEnabled = true
+
+        print("[Box2D-Upload] Stored box #\(drawnBoxCoords.count): \(box2D) in \(Int(imgW))x\(Int(imgH))")
+        updateStatus("\(drawnBoxCoords.count) box(es) drawn — draw more or tap Detect")
+    }
+
+    private func imageDisplayRect() -> CGRect {
+        guard let image = uploadedImage else { return uploadImageView.bounds }
+        let viewSize = uploadImageView.bounds.size
+        let imageSize = image.size
+        let scale = min(viewSize.width / imageSize.width, viewSize.height / imageSize.height)
+        let scaledW = imageSize.width * scale
+        let scaledH = imageSize.height * scale
+        return CGRect(
+            x: (viewSize.width - scaledW) / 2,
+            y: (viewSize.height - scaledH) / 2,
+            width: scaledW,
+            height: scaledH
+        )
     }
 
     private func sendAllBox2D() {
@@ -702,11 +1042,13 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
             }
         }
 
-        // Check 3D boxes by projecting centers to screen (much easier to tap)
-        let scenePoint = gesture.location(in: sceneView)
-        if let boxNode = bboxRenderer.nearestBox(to: scenePoint, in: sceneView) {
-            selectBox3D(boxNode)
-            return
+        // Check 3D boxes (camera mode only)
+        if inputMode == 0 {
+            let scenePoint = gesture.location(in: sceneView)
+            if let boxNode = bboxRenderer.nearestBox(to: scenePoint, in: sceneView) {
+                selectBox3D(boxNode)
+                return
+            }
         }
 
         // Tap on empty → deselect
@@ -720,6 +1062,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         boxView.layer.borderColor = UIColor.systemRed.cgColor
         boxView.backgroundColor = UIColor.systemRed.withAlphaComponent(0.25)
 
+        captionLabel.text = "  2D Box #\(index + 1) — Tap Detect to identify  "
+        captionLabel.isHidden = false
+
         deleteButton.isHidden = false
         positionDeleteButton(near: boxView.frame)
     }
@@ -728,6 +1073,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         deselectAllBoxes()
         bboxRenderer.selectBox(node)
         updateDeleteButtonForSelected3D()
+        if let pov = sceneView.pointOfView,
+           let text = bboxRenderer.captionText(for: node, cameraPosition: pov.simdWorldPosition, useMetric: useMetric) {
+            captionLabel.text = "  \(text)  "
+            captionLabel.isHidden = false
+        }
     }
 
     private func deselectAllBoxes() {
@@ -739,6 +1089,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         selectedBox2DIndex = nil
         bboxRenderer.deselectAll()
         deleteButton.isHidden = true
+        captionLabel.isHidden = true
     }
 
     private func positionDeleteButton(near rect: CGRect) {
@@ -854,6 +1205,48 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         return CaptureData(pngData: pngData, depthPngData: depthPng, alignmentPostProcess: alignmentPostProcess, intrinsicK: K, cameraToWorld: camToWorld)
     }
 
+    private func extractCaptureDataFromUpload(image: UIImage) -> CaptureData {
+        let origW = image.size.width
+        let origH = image.size.height
+        let scale = min(1.0, maxImageDimension / max(origW, origH))
+        let newW = origW * scale
+        let newH = origH * scale
+
+        let resized: UIImage
+        if scale < 1.0 {
+            let renderer = UIGraphicsImageRenderer(size: CGSize(width: newW, height: newH))
+            resized = renderer.image { _ in
+                image.draw(in: CGRect(x: 0, y: 0, width: newW, height: newH))
+            }
+        } else {
+            resized = image
+        }
+        let pngData = resized.pngData()!
+
+        // Default intrinsics: focal length = max dimension, principal point = center
+        let f = Float(max(newW, newH))
+        let cx = Float(newW) / 2
+        let cy = Float(newH) / 2
+        let K: [[Float]] = [
+            [f,  0, cx],
+            [0,  f, cy],
+            [0,  0,  1],
+        ]
+
+        // Identity camera-to-world
+        let camToWorld: [[Float]] = [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+
+        print("[Upload] Original: \(Int(origW))x\(Int(origH)), Resized: \(Int(newW))x\(Int(newH)), PNG: \(pngData.count/1024)KB")
+        print("[Upload] Default K: f=\(f) cx=\(cx) cy=\(cy)")
+
+        return CaptureData(pngData: pngData, depthPngData: nil, alignmentPostProcess: false, intrinsicK: K, cameraToWorld: camToWorld)
+    }
+
     private func depthMapTo16BitPNG(_ depthMap: CVPixelBuffer) -> Data? {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
@@ -907,19 +1300,38 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         let isBox = detectionMethod == 1
         panGesture.isEnabled = isBox
         promptBar.isHidden = isBox
-        captureSegment.isHidden = isBox
         multiViewDetectButton.isHidden = true
         multiViewFrames = []
 
-        if isBox {
-            captureButton.setTitle("  Detect  ", for: .normal)
-            captureButton.backgroundColor = UIColor.systemBlue
-            captureButton.isEnabled = false
-            updateStatus("Draw a 2D box around the object, then tap Detect")
+        if inputMode == 1 {
+            // Upload mode
+            if isBox {
+                captureButton.setTitle("  Detect  ", for: .normal)
+                captureButton.backgroundColor = .systemBlue
+                captureButton.isEnabled = false
+                if uploadedImage != nil {
+                    updateStatus("Draw a 2D box around the object, then tap Detect")
+                } else {
+                    updateStatus("Select a photo first, then draw 2D boxes")
+                }
+            } else {
+                captureButton.setTitle("  Detect  ", for: .normal)
+                captureButton.backgroundColor = .systemBlue
+                captureButton.isEnabled = uploadedImage != nil
+                updateStatus(uploadedImage != nil ? "Ready - Tap Detect" : "Select a photo to detect")
+            }
         } else {
-            resetCaptureButton()
-            captureButton.isEnabled = true
-            updateStatus("Ready - Tap Detect")
+            // Camera mode
+            if isBox {
+                captureButton.setTitle("  Detect  ", for: .normal)
+                captureButton.backgroundColor = UIColor.systemBlue
+                captureButton.isEnabled = false
+                updateStatus("Draw a 2D box around the object, then tap Detect")
+            } else {
+                resetCaptureButton()
+                captureButton.isEnabled = true
+                updateStatus("Ready - Tap Detect")
+            }
         }
         print("[DetectMethod] \(isBox ? "2D Box" : "Classes")")
     }
@@ -947,19 +1359,144 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, UI
         }
     }
 
-    // MARK: - Prompt Input
+    // MARK: - Class Management
 
-    @objc private func promptChanged() {
-        if let text = promptTextField.text, !text.isEmpty {
-            DetectionService.shared.textPrompt = text
-            print("[Prompt] Updated to: \(text)")
+    private func loadClasses() {
+        let defaults = UserDefaults.standard
+        savedClasses = defaults.stringArray(forKey: "savedClasses") ?? []
+        let active = defaults.stringArray(forKey: "activeClasses") ?? []
+        activeClasses = Set(active)
+
+        if savedClasses.isEmpty {
+            resetToDefaultClasses()
         }
+        updateTextPrompt()
     }
 
-    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
-        textField.resignFirstResponder()
-        promptChanged()
-        return true
+    private func saveClasses() {
+        let defaults = UserDefaults.standard
+        defaults.set(savedClasses, forKey: "savedClasses")
+        defaults.set(Array(activeClasses), forKey: "activeClasses")
+        updateTextPrompt()
+    }
+
+    private func updateTextPrompt() {
+        let active = savedClasses.filter { activeClasses.contains($0) }
+        DetectionService.shared.textPrompt = active.joined(separator: ".")
+        print("[Classes] Active: \(active.joined(separator: ", "))")
+    }
+
+    private static let defaultClasses = ["cup", "car", "table", "chair", "person"]
+
+    private func resetToDefaultClasses() {
+        savedClasses = Self.defaultClasses
+        activeClasses = Set(Self.defaultClasses)
+        saveClasses()
+    }
+
+    private func rebuildChips() {
+        chipsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for className in savedClasses {
+            let chip = makeChip(title: className, isActive: activeClasses.contains(className))
+            chipsStack.addArrangedSubview(chip)
+        }
+        let addBtn = UIButton(type: .system)
+        addBtn.setTitle(" + ", for: .normal)
+        addBtn.titleLabel?.font = .systemFont(ofSize: 16, weight: .bold)
+        addBtn.setTitleColor(.white, for: .normal)
+        addBtn.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.7)
+        addBtn.layer.cornerRadius = 14
+        addBtn.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        addBtn.addTarget(self, action: #selector(addNewClass), for: .touchUpInside)
+        chipsStack.addArrangedSubview(addBtn)
+
+        let resetBtn = UIButton(type: .system)
+        resetBtn.setImage(UIImage(systemName: "arrow.counterclockwise"), for: .normal)
+        resetBtn.tintColor = .lightGray
+        resetBtn.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        resetBtn.addTarget(self, action: #selector(resetClassesTapped), for: .touchUpInside)
+        chipsStack.addArrangedSubview(resetBtn)
+    }
+
+    @objc private func resetClassesTapped() {
+        let alert = UIAlertController(title: "Reset Classes", message: "Restore default classes?", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Reset", style: .destructive) { [weak self] _ in
+            guard let self = self else { return }
+            self.resetToDefaultClasses()
+            self.rebuildChips()
+            self.updateStatus("Classes reset to defaults")
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func makeChip(title: String, isActive: Bool) -> UIButton {
+        let btn = UIButton(type: .system)
+        btn.setTitle(title, for: .normal)
+        btn.titleLabel?.font = .systemFont(ofSize: 12, weight: .medium)
+        if isActive {
+            btn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.8)
+            btn.setTitleColor(.white, for: .normal)
+        } else {
+            btn.backgroundColor = UIColor.darkGray.withAlphaComponent(0.6)
+            btn.setTitleColor(.gray, for: .normal)
+        }
+        btn.layer.cornerRadius = 14
+        btn.contentEdgeInsets = UIEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
+        btn.addTarget(self, action: #selector(chipTapped(_:)), for: .touchUpInside)
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(chipLongPressed(_:)))
+        btn.addGestureRecognizer(longPress)
+        return btn
+    }
+
+    @objc private func chipTapped(_ sender: UIButton) {
+        guard let title = sender.title(for: .normal) else { return }
+        if activeClasses.contains(title) {
+            activeClasses.remove(title)
+        } else {
+            activeClasses.insert(title)
+        }
+        saveClasses()
+        rebuildChips()
+    }
+
+    @objc private func chipLongPressed(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began,
+              let btn = gesture.view as? UIButton,
+              let title = btn.title(for: .normal) else { return }
+
+        let alert = UIAlertController(title: "Remove Class", message: "Delete '\(title)'?", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            guard let self = self else { return }
+            self.savedClasses.removeAll { $0 == title }
+            self.activeClasses.remove(title)
+            self.saveClasses()
+            self.rebuildChips()
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    @objc private func addNewClass() {
+        let alert = UIAlertController(title: "Add Class", message: nil, preferredStyle: .alert)
+        alert.addTextField { tf in
+            tf.placeholder = "e.g. bottle"
+            tf.autocapitalizationType = .none
+            tf.autocorrectionType = .no
+        }
+        alert.addAction(UIAlertAction(title: "Add", style: .default) { [weak self] _ in
+            guard let self = self,
+                  let text = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespaces),
+                  !text.isEmpty else { return }
+            if !self.savedClasses.contains(text) {
+                self.savedClasses.append(text)
+                self.activeClasses.insert(text)
+                self.saveClasses()
+                self.rebuildChips()
+            }
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
     }
 
     // MARK: - Settings
