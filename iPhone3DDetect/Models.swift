@@ -9,6 +9,7 @@ struct BBox3D: Codable {
     let color: [Float]?
     let score: Float
     let n_frames: Int?
+    let projected_corners: [[Float]?]?  // 8 corners as [u,v] in image pixels (upload mode)
 
     var centerSIMD: simd_float3 {
         simd_float3(center[0], center[1], center[2])

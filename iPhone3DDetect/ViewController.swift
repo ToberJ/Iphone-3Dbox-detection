@@ -507,20 +507,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                 updateStatus("No image to save")
                 return
             }
-            // Render uploadImageView + all overlay subviews (boxes) into one image,
+            // Render uploadImageView + wireframe overlay into one image,
             // then crop to the actual image display rect (removes black bars)
             let renderer = UIGraphicsImageRenderer(bounds: uploadImageView.bounds)
-            let fullScreenshot = renderer.image { ctx in
+            let fullScreenshot = renderer.image { _ in
                 uploadImageView.drawHierarchy(in: uploadImageView.bounds, afterScreenUpdates: true)
-                // Also draw any overlay views on top
-                for subview in view.subviews where subview !== uploadImageView && !subview.isHidden {
-                    if subview.frame.intersects(uploadImageView.frame) && subview.layer.opacity > 0 {
-                        let offset = subview.frame.origin
-                        ctx.cgContext.translateBy(x: offset.x, y: offset.y)
-                        subview.drawHierarchy(in: subview.bounds, afterScreenUpdates: true)
-                        ctx.cgContext.translateBy(x: -offset.x, y: -offset.y)
-                    }
-                }
             }
 
             // Crop to image display rect (remove black bars)
@@ -767,35 +758,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             }.joined(separator: ", ")
             updateStatus("\(modeTag) Found \(result.boxes.count): \(summary)")
             if inputMode == 1 {
-                // Upload mode: show sceneView with fixed camera + image background
-                sceneView.session.pause()
-                sceneView.scene.background.contents = uploadedImage
-
-                // Fix camera at identity (origin, looking along -Z)
-                let cameraNode = SCNNode()
-                cameraNode.camera = SCNCamera()
-
-                // Use predicted intrinsics for FOV if available
-                if let pi = result.predicted_intrinsics, let img = uploadedImage {
-                    let fov = CGFloat(pi.fovY(imageHeight: Float(img.size.height)))
-                    cameraNode.camera?.fieldOfView = fov
-                    print("[Upload] Using predicted FOV: \(fov)°, fy=\(pi.fy)")
-                } else {
-                    cameraNode.camera?.fieldOfView = 60
-                    print("[Upload] Using default FOV: 60°")
-                }
-
-                cameraNode.position = SCNVector3(0, 0, 0)
-                cameraNode.eulerAngles = SCNVector3Zero
-                sceneView.scene.rootNode.addChildNode(cameraNode)
-                sceneView.pointOfView = cameraNode
-                sceneView.allowsCameraControl = false
-
-                sceneView.isHidden = false
-                sceneView.alpha = 1.0
-                uploadImageView.isHidden = true
+                // Upload mode: draw 2D wireframe overlay on image
+                drawProjectedBoxes(result.boxes)
+            } else {
+                bboxRenderer.addBoxes(result.boxes)
             }
-            bboxRenderer.addBoxes(result.boxes)
         }
         finishDetection()
     }
@@ -1012,6 +979,85 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         updateStatus("\(drawnBoxCoords.count) box(es) drawn — draw more or tap Detect")
     }
 
+    // MARK: - Upload Mode 2D Wireframe Rendering
+
+    private var wireframeOverlay: UIView?
+
+    private func drawProjectedBoxes(_ boxes: [BBox3D]) {
+        // Remove old overlay
+        wireframeOverlay?.removeFromSuperview()
+
+        guard let image = uploadedImage else { return }
+        let displayRect = imageDisplayRect()
+
+        // Image pixel coords -> screen coords
+        let origW = image.size.width
+        let origH = image.size.height
+        let resizeScale = min(1.0, maxImageDimension / max(origW, origH))
+        let imgW = origW * resizeScale  // resized image dimensions (what API saw)
+        let imgH = origH * resizeScale
+
+        let overlay = UIView(frame: uploadImageView.bounds)
+        overlay.backgroundColor = .clear
+        overlay.isUserInteractionEnabled = false
+
+        // 12 edges of a box: pairs of corner indices
+        let edges: [(Int, Int)] = [
+            (0,1),(2,3),(4,5),(6,7),  // X-axis edges
+            (0,2),(1,3),(4,6),(5,7),  // Y-axis edges
+            (0,4),(1,5),(2,6),(3,7),  // Z-axis edges
+        ]
+
+        for box in boxes {
+            guard let corners = box.projected_corners, corners.count == 8 else { continue }
+
+            let c = box.displayColor
+            let color = UIColor(red: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: 1.0)
+
+            for (i, j) in edges {
+                guard let ci = corners[i], let cj = corners[j],
+                      ci.count >= 2, cj.count >= 2 else { continue }
+
+                // Convert from image pixel coords to screen coords
+                let sx1 = displayRect.origin.x + CGFloat(ci[0]) / CGFloat(imgW) * displayRect.width
+                let sy1 = displayRect.origin.y + CGFloat(ci[1]) / CGFloat(imgH) * displayRect.height
+                let sx2 = displayRect.origin.x + CGFloat(cj[0]) / CGFloat(imgW) * displayRect.width
+                let sy2 = displayRect.origin.y + CGFloat(cj[1]) / CGFloat(imgH) * displayRect.height
+
+                let line = CAShapeLayer()
+                let path = UIBezierPath()
+                path.move(to: CGPoint(x: sx1, y: sy1))
+                path.addLine(to: CGPoint(x: sx2, y: sy2))
+                line.path = path.cgPath
+                line.strokeColor = color.cgColor
+                line.lineWidth = 2.0
+                line.fillColor = nil
+                overlay.layer.addSublayer(line)
+            }
+
+            // Label at top of box
+            if let topCorners = [corners[2], corners[3], corners[6], corners[7]]
+                .compactMap({ $0 }).first,
+               topCorners.count >= 2 {
+                let lx = displayRect.origin.x + CGFloat(topCorners[0]) / CGFloat(imgW) * displayRect.width
+                let ly = displayRect.origin.y + CGFloat(topCorners[1]) / CGFloat(imgH) * displayRect.height - 18
+                let label = UILabel(frame: CGRect(x: lx - 40, y: ly, width: 120, height: 16))
+                label.text = "\(box.label) \(String(format: "%.0f%%", box.score * 100))"
+                label.font = .systemFont(ofSize: 11, weight: .bold)
+                label.textColor = color
+                label.textAlignment = .center
+                label.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+                label.layer.cornerRadius = 3
+                label.clipsToBounds = true
+                overlay.addSubview(label)
+            }
+        }
+
+        uploadImageView.addSubview(overlay)
+        wireframeOverlay = overlay
+        print("[Upload] Drew \(boxes.count) 2D wireframe boxes")
+    }
+
     private func imageDisplayRect() -> CGRect {
         guard let image = uploadedImage else { return uploadImageView.bounds }
         let viewSize = uploadImageView.bounds.size
@@ -1099,8 +1145,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         drawnBoxViews.removeAll()
         drawnBoxCoords.removeAll()
         box2DCaptureData = nil
+        uploadPngData = nil
         selectedBox2DIndex = nil
         deleteButton.isHidden = true
+        wireframeOverlay?.removeFromSuperview()
+        wireframeOverlay = nil
     }
 
     // MARK: - Box Selection & Deletion
