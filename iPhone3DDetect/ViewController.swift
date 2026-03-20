@@ -470,8 +470,11 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         result.itemProvider.loadObject(ofClass: UIImage.self) { [weak self] object, error in
             guard let self = self, let image = object as? UIImage else { return }
             let normalized = self.normalizeOrientation(image)
+            // Pre-encode PNG on background thread so Detect is instant
+            let pngData = self.resizeAndEncode(image: normalized)
             DispatchQueue.main.async {
                 self.uploadedImage = normalized
+                self.uploadPngData = pngData
                 self.uploadImageView.image = normalized
                 self.pickPhotoButton.isHidden = true
                 self.changePhotoButton.isHidden = false
@@ -554,11 +557,12 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                 return
             }
             guard !isDetecting else { return }
+            // Use cached PNG (pre-encoded when photo was picked)
+            let pngData = uploadPngData ?? resizeAndEncode(image: image)
             isDetecting = true
             captureButton.isEnabled = false
             updateStatus("Detecting objects...", showSpinner: true)
 
-            let pngData = resizeAndEncode(image: image)
             Task {
                 do {
                     let result = try await DetectionService.shared.detectUpload(pngData: pngData)
