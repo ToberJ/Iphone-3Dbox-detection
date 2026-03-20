@@ -766,9 +766,14 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                 return "\(box.label)(\(pct))"
             }.joined(separator: ", ")
             updateStatus("\(modeTag) Found \(result.boxes.count): \(summary)")
-            if inputMode == 0 {
-                bboxRenderer.addBoxes(result.boxes)
+            if inputMode == 1 {
+                // Upload mode: show sceneView overlaid on image for 3D box rendering
+                sceneView.scene.background.contents = uploadedImage
+                sceneView.isHidden = false
+                sceneView.alpha = 1.0
+                uploadImageView.isHidden = true
             }
+            bboxRenderer.addBoxes(result.boxes)
         }
         finishDetection()
     }
