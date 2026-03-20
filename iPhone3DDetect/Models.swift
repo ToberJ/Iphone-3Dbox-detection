@@ -29,9 +29,22 @@ struct BBox3D: Codable {
     }
 }
 
+struct PredictedIntrinsics: Codable {
+    let fx: Float
+    let fy: Float
+    let cx: Float
+    let cy: Float
+
+    /// Vertical FOV in degrees from fy and image height
+    func fovY(imageHeight: Float) -> Float {
+        return 2.0 * atan(imageHeight / (2.0 * fy)) * 180.0 / .pi
+    }
+}
+
 struct DetectionResponse: Codable {
     let boxes: [BBox3D]
     let mode: String?
+    let predicted_intrinsics: PredictedIntrinsics?
 }
 
 struct CaptureData {

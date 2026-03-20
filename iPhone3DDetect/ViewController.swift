@@ -774,7 +774,17 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                 // Fix camera at identity (origin, looking along -Z)
                 let cameraNode = SCNNode()
                 cameraNode.camera = SCNCamera()
-                cameraNode.camera?.fieldOfView = 60
+
+                // Use predicted intrinsics for FOV if available
+                if let pi = result.predicted_intrinsics, let img = uploadedImage {
+                    let fov = CGFloat(pi.fovY(imageHeight: Float(img.size.height)))
+                    cameraNode.camera?.fieldOfView = fov
+                    print("[Upload] Using predicted FOV: \(fov)°, fy=\(pi.fy)")
+                } else {
+                    cameraNode.camera?.fieldOfView = 60
+                    print("[Upload] Using default FOV: 60°")
+                }
+
                 cameraNode.position = SCNVector3(0, 0, 0)
                 cameraNode.eulerAngles = SCNVector3Zero
                 sceneView.scene.rootNode.addChildNode(cameraNode)
@@ -1071,7 +1081,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             await MainActor.run {
                 clearDrawnBoxes()
                 if !allBoxes.isEmpty {
-                    let combined = DetectionResponse(boxes: allBoxes, mode: lastMode)
+                    let combined = DetectionResponse(boxes: allBoxes, mode: lastMode, predicted_intrinsics: nil)
                     handleResult(combined)
                 } else if let err = errorMsg {
                     updateStatus("Error: \(err)")
