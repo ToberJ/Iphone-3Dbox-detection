@@ -857,7 +857,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.updateDeleteButtonForSelected3D()
-                if let text = self.bboxRenderer.captionText(for: selected, cameraPosition: pov.simdWorldPosition, useMetric: self.useMetric) {
+                if let text = self.bboxRenderer.captionText(for: selected, cameraPosition: pov.simdWorldPosition, unitMode: self.unitMode) {
                     self.captionLabel.text = "  \(text)  "
                     self.captionLabel.isHidden = false
                 }
