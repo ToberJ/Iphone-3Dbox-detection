@@ -248,6 +248,65 @@ class DetectionService {
         print("[DetectionClient] Box2D detected \(result.boxes.count) objects, mode=\(result.mode ?? "unknown")")
         return result
     }
+
+    // MARK: - Upload Mode (no intrinsics, no pose, no depth)
+
+    func detectUpload(pngData: Data) async throws -> DetectionResponse {
+        print("[DetectionClient] Upload detect: \(pngData.count / 1024)KB")
+
+        let body: [String: Any] = [
+            "image_base64": pngData.base64EncodedString(),
+            "text_prompt": textPrompt,
+            "score_threshold": scoreThreshold,
+            "mode": "upload"
+        ]
+
+        return try await sendRequest(body: body, label: "Upload")
+    }
+
+    func detectUploadWithBox2D(pngData: Data, box2D: [Float]) async throws -> DetectionResponse {
+        print("[DetectionClient] Upload Box2D: box=\(box2D), \(pngData.count / 1024)KB")
+
+        let body: [String: Any] = [
+            "image_base64": pngData.base64EncodedString(),
+            "box_2d": box2D,
+            "score_threshold": scoreThreshold,
+            "mode": "upload"
+        ]
+
+        return try await sendRequest(body: body, label: "Upload Box2D")
+    }
+
+    // MARK: - Shared Request Helper
+
+    private func sendRequest(body: [String: Any], label: String) async throws -> DetectionResponse {
+        let jsonData = try JSONSerialization.data(withJSONObject: body)
+        print("[DetectionClient] \(label) payload: \(jsonData.count / 1024)KB to \(apiUrl)")
+
+        var request = URLRequest(url: URL(string: apiUrl)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = jsonData
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        print("[DetectionClient] Response status: \(statusCode), body size: \(data.count)")
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "no body"
+            print("[DetectionClient] ERROR: \(responseBody)")
+            throw DetectionError.serverError(statusCode: statusCode, message: responseBody)
+        }
+
+        let responseText = String(data: data, encoding: .utf8) ?? ""
+        print("[DetectionClient] Response: \(responseText.prefix(500))")
+
+        let result = try JSONDecoder().decode(DetectionResponse.self, from: data)
+        print("[DetectionClient] \(label) detected \(result.boxes.count) objects, mode=\(result.mode ?? "unknown")")
+        return result
+    }
 }
 
 enum DetectionError: LocalizedError {
