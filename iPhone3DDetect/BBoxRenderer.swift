@@ -120,7 +120,7 @@ class BBoxRenderer {
         colors.removeValue(forKey: node)
     }
 
-    func updateLabels(cameraPosition: simd_float3, useMetric: Bool) {
+    func updateLabels(cameraPosition: simd_float3, unitMode: Int = 0) {
         let scale: Float = 0.003
         for node in boxNodes {
             guard let meta = metadata[node],
@@ -143,15 +143,42 @@ class BBoxRenderer {
     }
 
     /// Formatted caption string for a selected box (shown in screen-space overlay).
-    func captionText(for node: SCNNode, cameraPosition: simd_float3, useMetric: Bool) -> String? {
+    /// unitMode: 0 = meters, 1 = feet, 2 = centimeters
+    func captionText(for node: SCNNode, cameraPosition: simd_float3, unitMode: Int = 0) -> String? {
         guard let meta = metadata[node] else { return nil }
-        let factor: Float = useMetric ? 1.0 : 3.28084
-        let unit = useMetric ? "m" : "ft"
+
+        let factor: Float
+        let unit: String
+        let dimFmt: String
+        switch unitMode {
+        case 1:  // feet
+            factor = 3.28084; unit = "ft"; dimFmt = "%.2f"
+        case 2:  // centimeters
+            factor = 100.0; unit = "cm"; dimFmt = "%.1f"
+        default: // meters
+            factor = 1.0; unit = "m"; dimFmt = "%.2f"
+        }
+
         let dist = simd_distance(cameraPosition, node.simdWorldPosition) * factor
         let s = meta.sizeMeters * factor
         let pct = String(format: "%.0f%%", meta.score * 100)
-        let distStr = dist < 10 ? String(format: "%.2f", dist) : String(format: "%.1f", dist)
-        return "\(meta.label) (\(pct))  |  Distance: \(distStr)\(unit)  |  \(String(format: "%.2f × %.2f × %.2f", s.x, s.y, s.z)) \(unit)"
+        let distStr = dist < 10 * factor ? String(format: dimFmt, dist) : String(format: "%.1f", dist)
+
+        // Volume
+        let volM3 = meta.sizeMeters.x * meta.sizeMeters.y * meta.sizeMeters.z
+        let volStr: String
+        switch unitMode {
+        case 2:
+            let volCm3 = volM3 * 1_000_000
+            volStr = volCm3 < 1000 ? String(format: "%.0f cm3", volCm3) : String(format: "%.1fL", volCm3 / 1000)
+        default:
+            volStr = volM3 < 0.001 ? String(format: "%.1f cm3", volM3 * 1_000_000) : String(format: "%.4f m3", volM3)
+        }
+
+        // W x H x D
+        let dimStr = String(format: "\(dimFmt) x \(dimFmt) x \(dimFmt)", s.x, s.y, s.z)
+
+        return "\(meta.label) (\(pct))  |  Dist: \(distStr)\(unit)  |  \(dimStr) \(unit)  |  Vol: \(volStr)"
     }
 
     // MARK: - Node Creation
