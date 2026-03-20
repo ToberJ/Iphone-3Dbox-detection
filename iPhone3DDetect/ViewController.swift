@@ -27,7 +27,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
     private var captureSegment: UISegmentedControl!
     private var sendDepth = true
     private var alignmentPostProcess = true
-    private var useMetric = true
+    private var unitMode = 0  // 0=meters, 1=feet, 2=cm
     private var captureMode = 0  // 0=Single, 1=Multi-View, 2=Video
     private var clearButton: UIButton!
     private var videoFrames: [CaptureData] = []
@@ -57,6 +57,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
     private var inputModeSegment: UISegmentedControl!
     private var uploadImageView: UIImageView!
     private var uploadedImage: UIImage?
+    private var uploadPngData: Data?  // For upload mode box2D (no CaptureData needed)
     private var saveButton: UIButton!
     private var pickPhotoButton: UIButton!
     private var changePhotoButton: UIButton!
@@ -222,7 +223,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
 
         changePhotoButton = UIButton(type: .system)
         changePhotoButton.translatesAutoresizingMaskIntoConstraints = false
-        changePhotoButton.setImage(UIImage(systemName: "arrow.triangle.2.circlepath.camera.fill"), for: .normal)
+        changePhotoButton.setImage(UIImage(systemName: "square.and.arrow.up"), for: .normal)
         changePhotoButton.tintColor = .white
         changePhotoButton.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.8)
         changePhotoButton.layer.cornerRadius = 20
@@ -502,11 +503,41 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             let image = sceneView.snapshot()
             UIImageWriteToSavedPhotosAlbum(image, self, #selector(saveCompleted(_:didFinishSavingWithError:contextInfo:)), nil)
         } else {
-            guard let image = uploadedImage else {
+            guard uploadedImage != nil else {
                 updateStatus("No image to save")
                 return
             }
-            UIImageWriteToSavedPhotosAlbum(image, self, #selector(saveCompleted(_:didFinishSavingWithError:contextInfo:)), nil)
+            // Render uploadImageView + all overlay subviews (boxes) into one image,
+            // then crop to the actual image display rect (removes black bars)
+            let renderer = UIGraphicsImageRenderer(bounds: uploadImageView.bounds)
+            let fullScreenshot = renderer.image { ctx in
+                uploadImageView.drawHierarchy(in: uploadImageView.bounds, afterScreenUpdates: true)
+                // Also draw any overlay views on top
+                for subview in view.subviews where subview !== uploadImageView && !subview.isHidden {
+                    if subview.frame.intersects(uploadImageView.frame) && subview.layer.opacity > 0 {
+                        let offset = subview.frame.origin
+                        ctx.cgContext.translateBy(x: offset.x, y: offset.y)
+                        subview.drawHierarchy(in: subview.bounds, afterScreenUpdates: true)
+                        ctx.cgContext.translateBy(x: -offset.x, y: -offset.y)
+                    }
+                }
+            }
+
+            // Crop to image display rect (remove black bars)
+            let displayRect = imageDisplayRect()
+            let screenScale = UIScreen.main.scale
+            let cropRect = CGRect(
+                x: displayRect.origin.x * screenScale,
+                y: displayRect.origin.y * screenScale,
+                width: displayRect.width * screenScale,
+                height: displayRect.height * screenScale
+            )
+            if let cgCropped = fullScreenshot.cgImage?.cropping(to: cropRect) {
+                let cropped = UIImage(cgImage: cgCropped)
+                UIImageWriteToSavedPhotosAlbum(cropped, self, #selector(saveCompleted(_:didFinishSavingWithError:contextInfo:)), nil)
+            } else {
+                UIImageWriteToSavedPhotosAlbum(fullScreenshot, self, #selector(saveCompleted(_:didFinishSavingWithError:contextInfo:)), nil)
+            }
         }
     }
 
@@ -536,10 +567,10 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             captureButton.isEnabled = false
             updateStatus("Detecting objects...", showSpinner: true)
 
-            let captureData = extractCaptureDataFromUpload(image: image)
+            let pngData = resizeAndEncode(image: image)
             Task {
                 do {
-                    let result = try await DetectionService.shared.detect(capture: captureData)
+                    let result = try await DetectionService.shared.detectUpload(pngData: pngData)
                     await MainActor.run { handleResult(result) }
                 } catch {
                     await MainActor.run {
@@ -793,7 +824,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
     func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
         guard inputMode == 0 else { return }
         guard let pov = sceneView.pointOfView else { return }
-        bboxRenderer.updateLabels(cameraPosition: pov.simdWorldPosition, useMetric: useMetric)
+        bboxRenderer.updateLabels(cameraPosition: pov.simdWorldPosition, unitMode: unitMode)
 
         if let selected = bboxRenderer.selectedNode {
             DispatchQueue.main.async { [weak self] in
@@ -917,9 +948,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
     private func storeBox2DCoordsUpload(screenStart: CGPoint, screenEnd: CGPoint) {
         guard let image = uploadedImage else { return }
 
-        if box2DCaptureData == nil {
+        if box2DCaptureData == nil && inputMode == 0 {
+            // Camera mode: capture AR frame data
             flashScreen()
-            box2DCaptureData = extractCaptureDataFromUpload(image: image)
+        }
+        // Upload mode: no CaptureData needed, will use detectUploadWithBox2D
+        if box2DCaptureData == nil && inputMode == 1 {
+            flashScreen()
+            // Store PNG data for upload (no intrinsics/pose needed)
+            uploadPngData = resizeAndEncode(image: image)
         }
 
         let displayRect = imageDisplayRect()
@@ -964,7 +1001,10 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
     }
 
     private func sendAllBox2D() {
-        guard let capture = box2DCaptureData, !drawnBoxCoords.isEmpty else { return }
+        guard !drawnBoxCoords.isEmpty else { return }
+        // Camera mode needs CaptureData, upload mode needs pngData
+        if inputMode == 0 && box2DCaptureData == nil { return }
+        if inputMode == 1 && uploadPngData == nil { return }
         guard !isDetecting else { return }
 
         isDetecting = true
@@ -973,7 +1013,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         updateStatus("Detecting \(count) box(es)...", showSpinner: true)
 
         let coordsCopy = drawnBoxCoords
-        let captureCopy = capture
+        let captureCopy = box2DCaptureData
+        let pngCopy = uploadPngData
+        let isUpload = inputMode == 1
 
         Task {
             var allBoxes: [BBox3D] = []
@@ -985,7 +1027,14 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                     group.addTask {
                         do {
                             print("[Box2D] Sending box \(i+1)/\(count)")
-                            let result = try await DetectionService.shared.detectWithBox2D(capture: captureCopy, box2D: box2D)
+                            let result: DetectionResponse
+                            if isUpload, let png = pngCopy {
+                                result = try await DetectionService.shared.detectUploadWithBox2D(pngData: png, box2D: box2D)
+                            } else if let capture = captureCopy {
+                                result = try await DetectionService.shared.detectWithBox2D(capture: capture, box2D: box2D)
+                            } else {
+                                throw DetectionError.serverError(statusCode: -1, message: "No capture data")
+                            }
                             return (result, nil)
                         } catch {
                             return (nil, error)
@@ -1074,7 +1123,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         bboxRenderer.selectBox(node)
         updateDeleteButtonForSelected3D()
         if let pov = sceneView.pointOfView,
-           let text = bboxRenderer.captionText(for: node, cameraPosition: pov.simdWorldPosition, useMetric: useMetric) {
+           let text = bboxRenderer.captionText(for: node, cameraPosition: pov.simdWorldPosition, unitMode: unitMode) {
             captionLabel.text = "  \(text)  "
             captionLabel.isHidden = false
         }
@@ -1205,7 +1254,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         return CaptureData(pngData: pngData, depthPngData: depthPng, alignmentPostProcess: alignmentPostProcess, intrinsicK: K, cameraToWorld: camToWorld)
     }
 
-    private func extractCaptureDataFromUpload(image: UIImage) -> CaptureData {
+    /// Resize image and encode to PNG for upload mode (no intrinsics/pose needed)
+    private func resizeAndEncode(image: UIImage) -> Data {
         let origW = image.size.width
         let origH = image.size.height
         let scale = min(1.0, maxImageDimension / max(origW, origH))
@@ -1222,8 +1272,19 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             resized = image
         }
         let pngData = resized.pngData()!
+        print("[Upload] Resized: \(Int(newW))x\(Int(newH)), PNG: \(pngData.count/1024)KB")
+        return pngData
+    }
 
-        // Default intrinsics: focal length = max dimension, principal point = center
+    @available(*, deprecated, message: "Use resizeAndEncode + detectUpload instead")
+    private func extractCaptureDataFromUpload(image: UIImage) -> CaptureData {
+        let pngData = resizeAndEncode(image: image)
+        let origW = image.size.width
+        let origH = image.size.height
+        let scale = min(1.0, maxImageDimension / max(origW, origH))
+        let newW = origW * scale
+        let newH = origH * scale
+
         let f = Float(max(newW, newH))
         let cx = Float(newW) / 2
         let cy = Float(newH) / 2
@@ -1442,6 +1503,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             btn.setTitleColor(.gray, for: .normal)
         }
         btn.layer.cornerRadius = 14
+        btn.clipsToBounds = true
         btn.contentEdgeInsets = UIEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
         btn.addTarget(self, action: #selector(chipTapped(_:)), for: .touchUpInside)
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(chipLongPressed(_:)))
@@ -1503,7 +1565,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
 
     @objc private func showSettings() {
         let ds = DetectionService.shared
-        let unitLabel = useMetric ? "Units: Meters → Feet" : "Units: Feet → Meters"
+        let unitNames = ["Meters", "Feet", "Centimeters"]
+        let nextUnit = unitNames[(unitMode + 1) % 3]
+        let unitLabel = "Units: \(unitNames[unitMode]) → \(nextUnit)"
         let serverLabel = "Server: \(ds.serverName)"
 
         let alert = UIAlertController(title: "Settings", message: serverLabel, preferredStyle: .alert)
@@ -1535,10 +1599,10 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
 
         alert.addAction(UIAlertAction(title: unitLabel, style: .default) { [weak self] _ in
             guard let self = self else { return }
-            self.useMetric.toggle()
-            let newUnit = self.useMetric ? "Meters" : "Feet"
-            self.updateStatus("Units: \(newUnit)")
-            print("[Settings] Units switched to \(newUnit)")
+            self.unitMode = (self.unitMode + 1) % 3
+            let names = ["Meters", "Feet", "Centimeters"]
+            self.updateStatus("Units: \(names[self.unitMode])")
+            print("[Settings] Units switched to \(names[self.unitMode])")
         })
 
         alert.addAction(UIAlertAction(title: "Clear Boxes", style: .destructive) { [weak self] _ in
