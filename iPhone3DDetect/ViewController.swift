@@ -767,8 +767,20 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             }.joined(separator: ", ")
             updateStatus("\(modeTag) Found \(result.boxes.count): \(summary)")
             if inputMode == 1 {
-                // Upload mode: show sceneView overlaid on image for 3D box rendering
+                // Upload mode: show sceneView with fixed camera + image background
+                sceneView.session.pause()
                 sceneView.scene.background.contents = uploadedImage
+
+                // Fix camera at identity (origin, looking along -Z)
+                let cameraNode = SCNNode()
+                cameraNode.camera = SCNCamera()
+                cameraNode.camera?.fieldOfView = 60
+                cameraNode.position = SCNVector3(0, 0, 0)
+                cameraNode.eulerAngles = SCNVector3Zero
+                sceneView.scene.rootNode.addChildNode(cameraNode)
+                sceneView.pointOfView = cameraNode
+                sceneView.allowsCameraControl = false
+
                 sceneView.isHidden = false
                 sceneView.alpha = 1.0
                 uploadImageView.isHidden = true
