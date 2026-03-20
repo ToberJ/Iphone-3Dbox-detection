@@ -1002,10 +1002,13 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         overlay.isUserInteractionEnabled = false
 
         // 12 edges of a box: pairs of corner indices
+        // API box3d_to_corners ordering:
+        //   0:(+l,+h,+w) 1:(+l,-h,+w) 2:(-l,-h,+w) 3:(-l,+h,+w)
+        //   4:(+l,+h,-w) 5:(+l,-h,-w) 6:(-l,-h,-w) 7:(-l,+h,-w)
         let edges: [(Int, Int)] = [
-            (0,1),(2,3),(4,5),(6,7),  // X-axis edges
-            (0,2),(1,3),(4,6),(5,7),  // Y-axis edges
-            (0,4),(1,5),(2,6),(3,7),  // Z-axis edges
+            (0,1),(2,3),(4,5),(6,7),  // h-direction (vertical)
+            (0,3),(1,2),(4,7),(5,6),  // l-direction (horizontal)
+            (0,4),(1,5),(2,6),(3,7),  // w-direction (depth)
         ]
 
         for box in boxes {
@@ -1035,12 +1038,12 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                 overlay.layer.addSublayer(line)
             }
 
-            // Label at top of box
-            if let topCorners = [corners[2], corners[3], corners[6], corners[7]]
-                .compactMap({ $0 }).first,
-               topCorners.count >= 2 {
-                let lx = displayRect.origin.x + CGFloat(topCorners[0]) / CGFloat(imgW) * displayRect.width
-                let ly = displayRect.origin.y + CGFloat(topCorners[1]) / CGFloat(imgH) * displayRect.height - 18
+            // Label at top of box (indices 1,2,5,6 have -h/2 = top in OpenCV Y-down)
+            if let topCorner = [corners[1], corners[2], corners[5], corners[6]]
+                .compactMap({ $0 }).min(by: { $0[1] < $1[1] }),
+               topCorner.count >= 2 {
+                let lx = displayRect.origin.x + CGFloat(topCorner[0]) / CGFloat(imgW) * displayRect.width
+                let ly = displayRect.origin.y + CGFloat(topCorner[1]) / CGFloat(imgH) * displayRect.height - 18
                 let label = UILabel(frame: CGRect(x: lx - 40, y: ly, width: 120, height: 16))
                 label.text = "\(box.label) \(String(format: "%.0f%%", box.score * 100))"
                 label.font = .systemFont(ofSize: 11, weight: .bold)
