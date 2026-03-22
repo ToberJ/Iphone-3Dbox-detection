@@ -251,27 +251,44 @@ class DetectionService {
 
     // MARK: - Upload Mode (no intrinsics, no pose, no depth)
 
-    func detectUpload(pngData: Data) async throws -> DetectionResponse {
-        print("[DetectionClient] Upload detect: \(pngData.count / 1024)KB")
+    func detectUpload(pngData: Data, imageWidth: Int, imageHeight: Int) async throws -> DetectionResponse {
+        print("[DetectionClient] Upload detect: \(pngData.count / 1024)KB, \(imageWidth)x\(imageHeight)")
+
+        // Send default intrinsics so API returns projected_corners in our image space
+        let f = Float(max(imageWidth, imageHeight))
+        let cx = Float(imageWidth) / 2
+        let cy = Float(imageHeight) / 2
+        let K: [[Float]] = [[f, 0, cx], [0, f, cy], [0, 0, 1]]
+        let camToWorld: [[Float]] = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
 
         let body: [String: Any] = [
             "image_base64": pngData.base64EncodedString(),
             "text_prompt": textPrompt,
             "score_threshold": scoreThreshold,
-            "mode": "upload"
+            "mode": "upload",
+            "intrinsic": ["K": K],
+            "camera_to_world": ["matrix_4x4": camToWorld]
         ]
 
         return try await sendRequest(body: body, label: "Upload")
     }
 
-    func detectUploadWithBox2D(pngData: Data, box2D: [Float]) async throws -> DetectionResponse {
-        print("[DetectionClient] Upload Box2D: box=\(box2D), \(pngData.count / 1024)KB")
+    func detectUploadWithBox2D(pngData: Data, box2D: [Float], imageWidth: Int, imageHeight: Int) async throws -> DetectionResponse {
+        print("[DetectionClient] Upload Box2D: box=\(box2D), \(pngData.count / 1024)KB, \(imageWidth)x\(imageHeight)")
+
+        let f = Float(max(imageWidth, imageHeight))
+        let cx = Float(imageWidth) / 2
+        let cy = Float(imageHeight) / 2
+        let K: [[Float]] = [[f, 0, cx], [0, f, cy], [0, 0, 1]]
+        let camToWorld: [[Float]] = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
 
         let body: [String: Any] = [
             "image_base64": pngData.base64EncodedString(),
             "box_2d": box2D,
             "score_threshold": scoreThreshold,
-            "mode": "upload"
+            "mode": "upload",
+            "intrinsic": ["K": K],
+            "camera_to_world": ["matrix_4x4": camToWorld]
         ]
 
         return try await sendRequest(body: body, label: "Upload Box2D")

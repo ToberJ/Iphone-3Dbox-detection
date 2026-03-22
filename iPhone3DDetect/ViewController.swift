@@ -559,13 +559,14 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             guard !isDetecting else { return }
             // Use cached PNG (pre-encoded when photo was picked)
             let pngData = uploadPngData ?? resizeAndEncode(image: image)
+            let (imgW, imgH) = resizedImageDimensions(image: image)
             isDetecting = true
             captureButton.isEnabled = false
             updateStatus("Detecting objects...", showSpinner: true)
 
             Task {
                 do {
-                    let result = try await DetectionService.shared.detectUpload(pngData: pngData)
+                    let result = try await DetectionService.shared.detectUpload(pngData: pngData, imageWidth: imgW, imageHeight: imgH)
                     await MainActor.run { handleResult(result) }
                 } catch {
                     await MainActor.run {
@@ -763,7 +764,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             updateStatus("\(modeTag) Found \(result.boxes.count): \(summary)")
             if inputMode == 1 {
                 // Upload mode: draw 2D wireframe overlay on image
-                drawProjectedBoxes(result.boxes)
+                drawProjectedBoxes(result)
             } else {
                 bboxRenderer.addBoxes(result.boxes)
             }
@@ -849,7 +850,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
     // MARK: - 2D Box Drawing (Multiple)
 
     @objc private func handleBoxDrag(_ gesture: UIPanGestureRecognizer) {
-        let location = gesture.location(in: view)
+        // Upload mode: use uploadImageView coords so displayRect mapping is correct
+        let targetView: UIView = inputMode == 1 ? (uploadImageView ?? view) : view
+        let location = gesture.location(in: targetView)
 
         switch gesture.state {
         case .began:
@@ -859,8 +862,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             let overlay = makeBoxOverlay()
             overlay.frame = CGRect(origin: location, size: .zero)
             overlay.isHidden = false
-            view.addSubview(overlay)
-            view.bringSubviewToFront(overlay)
+            targetView.addSubview(overlay)
+            targetView.bringSubviewToFront(overlay)
             drawnBoxViews.append(overlay)
 
         case .changed:
@@ -987,54 +990,94 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
 
     private var wireframeOverlay: UIView?
 
-    private func drawProjectedBoxes(_ boxes: [BBox3D]) {
+    private func drawProjectedBoxes(_ result: DetectionResponse) {
         // Remove old overlay
         wireframeOverlay?.removeFromSuperview()
 
         guard let image = uploadedImage else { return }
         let displayRect = imageDisplayRect()
+        let boxes = result.boxes
 
-        // Image pixel coords -> screen coords
+        // Determine the API's image dimensions from predicted_intrinsics
+        // The principal point (cx, cy) ≈ center of image, so apiW ≈ 2*cx, apiH ≈ 2*cy
         let origW = image.size.width
         let origH = image.size.height
         let resizeScale = min(1.0, maxImageDimension / max(origW, origH))
-        let imgW = origW * resizeScale  // resized image dimensions (what API saw)
-        let imgH = origH * resizeScale
+        let sentW = Float(origW * resizeScale)
+        let sentH = Float(origH * resizeScale)
+
+        // Use OUR sent intrinsics (matching the identity cam2world we sent to API)
+        let fx = max(sentW, sentH)
+        let fy = fx
+        let pcx = sentW / 2
+        let pcy = sentH / 2
+        print("[Upload] Using sent intrinsics: f=\(fx), cx=\(pcx), cy=\(pcy), sent=\(sentW)x\(sentH)")
 
         let overlay = UIView(frame: uploadImageView.bounds)
         overlay.backgroundColor = .clear
         overlay.isUserInteractionEnabled = false
 
-        // 12 edges of a box: pairs of corner indices
-        // API box3d_to_corners ordering:
-        //   0:(+l,+h,+w) 1:(+l,-h,+w) 2:(-l,-h,+w) 3:(-l,+h,+w)
-        //   4:(+l,+h,-w) 5:(+l,-h,-w) 6:(-l,-h,-w) 7:(-l,+h,-w)
         let edges: [(Int, Int)] = [
-            (0,1),(2,3),(4,5),(6,7),  // h-direction (vertical)
-            (0,3),(1,2),(4,7),(5,6),  // l-direction (horizontal)
-            (0,4),(1,5),(2,6),(3,7),  // w-direction (depth)
+            (0,1),(2,3),(4,5),(6,7),
+            (0,2),(1,3),(4,6),(5,7),
+            (0,4),(1,5),(2,6),(3,7),
         ]
 
+        var drawnCount = 0
         for box in boxes {
-            guard let corners = box.projected_corners, corners.count == 8 else { continue }
+            // Client-side reprojection with coordinate system conversion
+            // API uses left-handed (Unity) convention; convert like BBoxRenderer does:
+            //   center.z negated, quaternion (ix,iy negated, iz kept), extra 90° Y rotation
+            let rawCenter = box.centerSIMD
+            let center = simd_float3(rawCenter.x, rawCenter.y, -rawCenter.z)
+
+            let q = box.quaternion
+            let rhQuat = simd_quatf(ix: -q.imag.x, iy: -q.imag.y, iz: q.imag.z, r: q.real)
+            let finalQuat = rhQuat * simd_quatf(angle: .pi / 2, axis: simd_float3(0, 1, 0))
+
+            let size = box.sizeSIMD
+            let hx = size.x / 2, hy = size.y / 2, hz = size.z / 2
+            let localCorners: [simd_float3] = [
+                simd_float3(-hx, -hy, -hz), simd_float3( hx, -hy, -hz),
+                simd_float3(-hx,  hy, -hz), simd_float3( hx,  hy, -hz),
+                simd_float3(-hx, -hy,  hz), simd_float3( hx, -hy,  hz),
+                simd_float3(-hx,  hy,  hz), simd_float3( hx,  hy,  hz),
+            ]
+
+            var screenPts: [CGPoint] = []
+            var allValid = true
+            for lc in localCorners {
+                // Rotate local corner, then translate to world
+                let world = finalQuat.act(lc) + center
+                // For pinhole projection, need positive depth
+                // In right-handed camera space: -Z is forward, so depth = -world.z
+                let depth = -world.z
+                guard depth > 0.001 else { allValid = false; break }
+                let u = fx * world.x / depth + pcx
+                // Y-up in 3D → Y-down in image: v = cy - fy * Y / depth
+                let v = pcy - fy * world.y / depth
+                let normU = CGFloat(u) / CGFloat(sentW)
+                let normV = CGFloat(v) / CGFloat(sentH)
+                let sx = displayRect.origin.x + normU * displayRect.width
+                let sy = displayRect.origin.y + normV * displayRect.height
+                screenPts.append(CGPoint(x: sx, y: sy))
+            }
+            if !allValid { screenPts.removeAll() }
+
+            guard screenPts.count == 8 else {
+                print("[Upload] Box \(box.label): skipped (invalid depth)")
+                continue
+            }
 
             let c = box.displayColor
             let color = UIColor(red: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: 1.0)
 
+            // Draw 12 edges
             for (i, j) in edges {
-                guard let ci = corners[i], let cj = corners[j],
-                      ci.count >= 2, cj.count >= 2 else { continue }
-
-                // Convert from image pixel coords to screen coords
-                let sx1 = displayRect.origin.x + CGFloat(ci[0]) / CGFloat(imgW) * displayRect.width
-                let sy1 = displayRect.origin.y + CGFloat(ci[1]) / CGFloat(imgH) * displayRect.height
-                let sx2 = displayRect.origin.x + CGFloat(cj[0]) / CGFloat(imgW) * displayRect.width
-                let sy2 = displayRect.origin.y + CGFloat(cj[1]) / CGFloat(imgH) * displayRect.height
-
                 let line = CAShapeLayer()
                 let path = UIBezierPath()
-                path.move(to: CGPoint(x: sx1, y: sy1))
-                path.addLine(to: CGPoint(x: sx2, y: sy2))
+                path.move(to: screenPts[i])
+                path.addLine(to: screenPts[j])
                 line.path = path.cgPath
                 line.strokeColor = color.cgColor
                 line.lineWidth = 2.0
@@ -1042,13 +1085,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                 overlay.layer.addSublayer(line)
             }
 
-            // Label at top of box (indices 1,2,5,6 have -h/2 = top in OpenCV Y-down)
-            if let topCorner = [corners[1], corners[2], corners[5], corners[6]]
-                .compactMap({ $0 }).min(by: { $0[1] < $1[1] }),
-               topCorner.count >= 2 {
-                let lx = displayRect.origin.x + CGFloat(topCorner[0]) / CGFloat(imgW) * displayRect.width
-                let ly = displayRect.origin.y + CGFloat(topCorner[1]) / CGFloat(imgH) * displayRect.height - 18
-                let label = UILabel(frame: CGRect(x: lx - 40, y: ly, width: 120, height: 16))
+            // Label at topmost corner
+            if let topPt = screenPts.min(by: { $0.y < $1.y }) {
+                let label = UILabel(frame: CGRect(x: topPt.x - 50, y: topPt.y - 20, width: 120, height: 16))
                 label.text = "\(box.label) \(String(format: "%.0f%%", box.score * 100))"
                 label.font = .systemFont(ofSize: 11, weight: .bold)
                 label.textColor = color
@@ -1058,11 +1097,12 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                 label.clipsToBounds = true
                 overlay.addSubview(label)
             }
+            drawnCount += 1
         }
 
         uploadImageView.addSubview(overlay)
         wireframeOverlay = overlay
-        print("[Upload] Drew \(boxes.count) 2D wireframe boxes")
+        print("[Upload] Drew \(drawnCount)/\(boxes.count) 2D wireframe boxes, displayRect=\(displayRect), viewBounds=\(uploadImageView.bounds)")
     }
 
     private func imageDisplayRect() -> CGRect {
@@ -1096,6 +1136,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         let captureCopy = box2DCaptureData
         let pngCopy = uploadPngData
         let isUpload = inputMode == 1
+        let uploadImgSize = uploadedImage.map { resizedImageDimensions(image: $0) }
 
         Task {
             var allBoxes: [BBox3D] = []
@@ -1108,8 +1149,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
                         do {
                             print("[Box2D] Sending box \(i+1)/\(count)")
                             let result: DetectionResponse
-                            if isUpload, let png = pngCopy {
-                                result = try await DetectionService.shared.detectUploadWithBox2D(pngData: png, box2D: box2D)
+                            if isUpload, let png = pngCopy, let dims = uploadImgSize {
+                                result = try await DetectionService.shared.detectUploadWithBox2D(pngData: png, box2D: box2D, imageWidth: dims.0, imageHeight: dims.1)
                             } else if let capture = captureCopy {
                                 result = try await DetectionService.shared.detectWithBox2D(capture: capture, box2D: box2D)
                             } else {
@@ -1345,18 +1386,25 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         let newW = origW * scale
         let newH = origH * scale
 
-        let resized: UIImage
-        if scale < 1.0 {
-            let renderer = UIGraphicsImageRenderer(size: CGSize(width: newW, height: newH))
-            resized = renderer.image { _ in
-                image.draw(in: CGRect(x: 0, y: 0, width: newW, height: newH))
-            }
-        } else {
-            resized = image
+        // Force standard sRGB 8-bit at @1x scale so pixel dimensions = point dimensions
+        let format = UIGraphicsImageRendererFormat()
+        format.preferredRange = .standard
+        format.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: newW, height: newH), format: format)
+        let resized = renderer.image { _ in
+            image.draw(in: CGRect(x: 0, y: 0, width: newW, height: newH))
         }
-        let pngData = resized.pngData()!
-        print("[Upload] Resized: \(Int(newW))x\(Int(newH)), PNG: \(pngData.count/1024)KB")
-        return pngData
+        // Use JPEG (quality 85%) instead of PNG — ~10x smaller for photos
+        let jpegData = resized.jpegData(compressionQuality: 0.85)!
+        print("[Upload] Resized: \(Int(newW))x\(Int(newH)), JPEG: \(jpegData.count/1024)KB")
+        return jpegData
+    }
+
+    private func resizedImageDimensions(image: UIImage) -> (Int, Int) {
+        let origW = image.size.width
+        let origH = image.size.height
+        let scale = min(1.0, maxImageDimension / max(origW, origH))
+        return (Int(origW * scale), Int(origH * scale))
     }
 
     @available(*, deprecated, message: "Use resizeAndEncode + detectUpload instead")
