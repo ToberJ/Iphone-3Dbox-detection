@@ -8,7 +8,7 @@ import onnxruntime_objc
 ///
 /// Two ONNX models to avoid OOM:
 ///   1. text_encoder_int8.onnx (339MB): token_ids -> text_features
-///   2. main_model_int8.onnx (795MB): image+depth+intrinsics+text_features -> detections
+///   2. main_model_int4.onnx (795MB): image+depth+intrinsics+text_features -> detections
 ///
 /// Flow: load text encoder -> encode all categories -> unload ->
 ///       load main model -> run per category with cached features -> unload
@@ -65,8 +65,8 @@ class LocalInferenceService {
         guard getFilePath("text_encoder_int8.onnx") != nil else {
             throw LocalInferenceError.modelNotFound("text_encoder_int8.onnx")
         }
-        guard getFilePath("main_model_int8.onnx") != nil else {
-            throw LocalInferenceError.modelNotFound("main_model_int8.onnx")
+        guard getFilePath("main_model_int4.onnx") != nil else {
+            throw LocalInferenceError.modelNotFound("main_model_int4.onnx")
         }
 
         isModelLoaded = true
@@ -85,7 +85,7 @@ class LocalInferenceService {
 
     // HuggingFace URLs
     private static let textEncoderURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/text_encoder_int8.onnx"
-    private static let mainModelURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/main_model_int8.onnx"
+    private static let mainModelURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/main_model_int4.onnx"
     private static let vocabURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/bpe_vocab.txt"
 
     private func getFilePath(_ filename: String) -> String? {
@@ -105,7 +105,7 @@ class LocalInferenceService {
 
         let files: [(String, String, String)] = [
             ("text_encoder_int8.onnx", Self.textEncoderURL, "Downloading text encoder (339MB)..."),
-            ("main_model_int8.onnx", Self.mainModelURL, "Downloading main model (795MB)..."),
+            ("main_model_int4.onnx", Self.mainModelURL, "Downloading main model (560MB)..."),
             ("bpe_vocab.txt", Self.vocabURL, "Downloading tokenizer vocab..."),
         ]
 
@@ -180,8 +180,8 @@ class LocalInferenceService {
         let mainEnv = try ORTEnv(loggingLevel: .warning)
         let mainOptions = try ORTSessionOptions()
         try mainOptions.setGraphOptimizationLevel(.basic)
-        guard let mainPath = getFilePath("main_model_int8.onnx") else {
-            throw LocalInferenceError.modelNotFound("main_model_int8.onnx")
+        guard let mainPath = getFilePath("main_model_int4.onnx") else {
+            throw LocalInferenceError.modelNotFound("main_model_int4.onnx")
         }
         let mainSession = try ORTSession(env: mainEnv, modelPath: mainPath, sessionOptions: mainOptions)
 
