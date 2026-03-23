@@ -28,6 +28,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
     private var sendDepth = true
     private var alignmentPostProcess = true
     private var unitMode = 0  // 0=meters, 1=feet, 2=cm
+    private var useLocalModel = false  // Toggle for local ONNX inference
     private var captureMode = 0  // 0=Single, 1=Multi-View, 2=Video
     private var clearButton: UIButton!
     private var videoFrames: [CaptureData] = []
@@ -619,7 +620,20 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
 
         Task {
             do {
-                let result = try await DetectionService.shared.detect(capture: captureData)
+                let result: DetectionResponse
+                if useLocalModel {
+                    if !LocalInferenceService.shared.isModelLoaded {
+                        // Download model if needed, then load
+                        try await LocalInferenceService.shared.downloadModelIfNeeded { status in
+                            Task { @MainActor in self.updateStatus(status, showSpinner: true) }
+                        }
+                        await MainActor.run { updateStatus("Loading ONNX model...", showSpinner: true) }
+                        try LocalInferenceService.shared.loadModels()
+                    }
+                    result = try await LocalInferenceService.shared.detect(capture: captureData)
+                } else {
+                    result = try await DetectionService.shared.detect(capture: captureData)
+                }
                 await MainActor.run { handleResult(result) }
             } catch {
                 await MainActor.run {
@@ -1734,6 +1748,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             let names = ["Meters", "Feet", "Centimeters"]
             self.updateStatus("Units: \(names[self.unitMode])")
             print("[Settings] Units switched to \(names[self.unitMode])")
+        })
+
+        let localTitle = useLocalModel ? "Switch to Server" : "Switch to Local (ONNX)"
+        alert.addAction(UIAlertAction(title: localTitle, style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            self.useLocalModel.toggle()
+            let modeStr = self.useLocalModel ? "Local (ONNX)" : "Server (\(ds.serverName))"
+            self.updateStatus("Mode: \(modeStr)")
+            print("[Settings] Inference mode: \(modeStr)")
         })
 
         alert.addAction(UIAlertAction(title: "Clear Boxes", style: .destructive) { [weak self] _ in
