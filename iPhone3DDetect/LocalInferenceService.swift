@@ -15,11 +15,11 @@ class LocalInferenceService {
     private var session: ORTSession?
     private var env: ORTEnv?
     private(set) var isModelLoaded = false
+    private var tokenizer: BPETokenizer?
 
-    // Must match the baked text prompts in the ONNX model
-    private let bakedPrompts = ["monitor", "keyboard", "table", "chair", "computer"]
-    private let nPrompts = 5
+    // Model runs 1 prompt at a time, Swift loops over categories
     private let nQueries = 200
+    private let contextLength = 32  // text encoder context length
 
     // SAM3 input size
     private let inputSize = 1008
@@ -61,47 +61,55 @@ class LocalInferenceService {
         }
 
         session = try ORTSession(env: env!, modelPath: modelPath, sessionOptions: options)
+
+        // Load BPE tokenizer
+        guard let vocabPath = getVocabPath() else {
+            throw LocalInferenceError.modelNotFound("bpe_vocab.txt")
+        }
+        tokenizer = try BPETokenizer(vocabPath: vocabPath)
+
         isModelLoaded = true
-        print("[LocalInference] Model loaded: \(modelPath)")
+        print("[LocalInference] Model + tokenizer loaded")
     }
 
-    // HuggingFace model URL (single INT8 file, ~795MB)
-    private static let modelURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/model.onnx"
+    // HuggingFace URLs
+    private static let modelURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/model_int8.onnx"
+    private static let vocabURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/bpe_vocab.txt"
 
     private func getModelPath() -> String? {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let modelPath = docs.appendingPathComponent("sam3_3d_model.onnx").path
-
         if FileManager.default.fileExists(atPath: modelPath) {
             return modelPath
         }
-
-        // Check app bundle as fallback
         return Bundle.main.path(forResource: "model", ofType: "onnx")
     }
 
-    /// Download model from HuggingFace if not present.
+    private func getVocabPath() -> String? {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let vocabPath = docs.appendingPathComponent("bpe_vocab.txt").path
+        if FileManager.default.fileExists(atPath: vocabPath) {
+            return vocabPath
+        }
+        return Bundle.main.path(forResource: "bpe_vocab", ofType: "txt")
+    }
+
+    /// Download model + vocab from HuggingFace if not present.
     func downloadModelIfNeeded(progress: @escaping (String) -> Void) async throws {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let modelPath = docs.appendingPathComponent("sam3_3d_model.onnx")
 
-        // Download model (single file, ~795MB INT8)
+        let modelPath = docs.appendingPathComponent("sam3_3d_model.onnx")
         if !FileManager.default.fileExists(atPath: modelPath.path) {
-            progress("Downloading model (795MB)...")
+            progress("Downloading model (1.1GB)...")
             let (tempURL, _) = try await URLSession.shared.download(from: URL(string: Self.modelURL)!)
             try FileManager.default.moveItem(at: tempURL, to: modelPath)
         }
 
-        // Verify files exist and are not empty
-        for (path, name) in [(modelPath, "model.onnx"), (weightsPath, "weights.bin")] {
-            let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
-            let size = attrs[.size] as? Int64 ?? 0
-            if size < 1000 {
-                // File is too small, probably a failed download
-                try FileManager.default.removeItem(at: path)
-                throw LocalInferenceError.modelNotFound("\(name) download incomplete (\(size) bytes). Please try again.")
-            }
-            print("[LocalInference] \(name): \(size / 1_000_000)MB")
+        let vocabPath = docs.appendingPathComponent("bpe_vocab.txt")
+        if !FileManager.default.fileExists(atPath: vocabPath.path) {
+            progress("Downloading tokenizer vocab...")
+            let (tempURL, _) = try await URLSession.shared.download(from: URL(string: Self.vocabURL)!)
+            try FileManager.default.moveItem(at: tempURL, to: vocabPath)
         }
 
         progress("Model ready!")
@@ -132,30 +140,115 @@ class LocalInferenceService {
     // MARK: - Detection (same interface as DetectionService)
 
     func detect(capture: CaptureData) async throws -> DetectionResponse {
-        guard isModelLoaded, let session = session else {
+        guard isModelLoaded, let session = session, let tokenizer = tokenizer else {
             throw LocalInferenceError.notLoaded
         }
 
         let startTime = CFAbsoluteTimeGetCurrent()
 
-        // 1. Preprocess (replicates API's preprocess_sam3_3d + fix_cy + preprocess_depth)
+        // 1. Preprocess image + depth + intrinsics (same for all categories)
         let preprocessed = try preprocess(capture: capture)
 
-        // 2. Run ONNX inference
-        let outputs = try runInference(session: session, input: preprocessed)
+        // 2. Parse categories from text prompt
+        let textPrompt = DetectionService.shared.textPrompt
+        let categories = textPrompt.split(separator: ".").map { String($0).trimmingCharacters(in: .whitespaces) }
+        let scoreThreshold = DetectionService.shared.scoreThreshold
 
-        // 3. Postprocess (replicates API's _forward_test + run_detection)
-        let boxes = postprocess(
-            outputs: outputs,
-            preprocessed: preprocessed,
-            cameraToWorld: capture.cameraToWorld,
-            scoreThreshold: DetectionService.shared.scoreThreshold
-        )
+        // 3. Loop over categories — 1 prompt per ONNX call
+        var allProposals: [(score2d: Float, scoreAll: Float, box2d: [Float], box3d: [Float], classId: Int)] = []
+
+        for (classIdx, category) in categories.enumerated() {
+            // Tokenize
+            let tokenIds = tokenizer.encode(category, contextLength: contextLength)
+            var tokenIdsInt64 = tokenIds.map { Int64($0) }
+
+            // Create token_ids ORTValue (1, 32) int64
+            let tokenData = NSMutableData(bytes: &tokenIdsInt64,
+                                          length: contextLength * MemoryLayout<Int64>.size)
+            let tokenValue = try ORTValue(tensorData: tokenData, elementType: .int64,
+                                          shape: [1, NSNumber(value: contextLength)])
+
+            // Run inference for this single category
+            let outputs = try runInference(session: session, input: preprocessed, tokenIds: tokenValue)
+
+            // Extract proposals for this category (N=1 prompt, S=200 queries)
+            let S = nQueries
+            let H = Float(inputSize)
+            let W = Float(inputSize)
+
+            let presenceScore = sigmoid(outputs.presenceLogits[0])
+
+            for q in 0..<S {
+                let logit2d = outputs.predLogits[q]
+                let logit3d = outputs.predConf3d[q]
+                let score2d = sigmoid(logit2d) * presenceScore
+                let score3d = sigmoid(logit3d)
+                let scoreAll = score2d + 0.5 * score3d
+
+                if score2d < scoreThreshold { continue }
+
+                let b2dBase = q * 4
+                let box2d = [
+                    outputs.predBoxes2d[b2dBase] * W,
+                    outputs.predBoxes2d[b2dBase + 1] * H,
+                    outputs.predBoxes2d[b2dBase + 2] * W,
+                    outputs.predBoxes2d[b2dBase + 3] * H,
+                ]
+                let b3dBase = q * 12
+                let box3d = Array(outputs.predBoxes3d[b3dBase..<b3dBase + 12])
+
+                allProposals.append((score2d, scoreAll, box2d, box3d, classIdx))
+            }
+        }
+
+        if allProposals.isEmpty {
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+            print("[LocalInference] 0 detections in \(String(format: "%.1f", elapsed))s")
+            return DetectionResponse(boxes: [], mode: "local_onnx", predicted_intrinsics: nil)
+        }
+
+        // 4. Per-class NMS on merged proposals
+        let kept = batchedNMS(proposals: allProposals, iouThreshold: iouThreshold)
+
+        // 5. Decode 3D boxes + camera-to-world
+        let K = preprocessed.intrinsicsPadded
+        var worldBoxes: [BBox3D] = []
+
+        for idx in kept {
+            let prop = allProposals[idx]
+            let decoded = decodeBox3D(box2d: prop.box2d, box3dEncoded: prop.box3d, K: K)
+            let worldResult = cameraToWorldTransform(
+                center: [decoded.cx, decoded.cy, decoded.cz],
+                dims: [decoded.w, decoded.l, decoded.h],
+                quaternion: decoded.quaternion,
+                cameraToWorld: capture.cameraToWorld
+            )
+
+            let classIdx = prop.classId
+            let label = classIdx < categories.count ? categories[classIdx] : "object"
+            let colorIdx = classIdx % categoryColors.count
+
+            worldBoxes.append(BBox3D(
+                label: label,
+                center: worldResult.center,
+                size: worldResult.size,
+                rotation: worldResult.rotation,
+                color: categoryColors[colorIdx],
+                score: prop.score2d,
+                n_frames: nil,
+                projected_corners: nil
+            ))
+        }
+
+        // 6. Cross-class NMS
+        if categories.count > 1 && worldBoxes.count > 1 {
+            worldBoxes = crossClassNMS(worldBoxes, distance: nmsDistance)
+        }
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-        print("[LocalInference] \(boxes.count) detections in \(String(format: "%.1f", elapsed))s")
+        print("[LocalInference] \(worldBoxes.count) detections in \(String(format: "%.1f", elapsed))s (\(categories.count) categories)")
 
-        return DetectionResponse(boxes: boxes, mode: "local_onnx", predicted_intrinsics: nil)
+        return DetectionResponse(boxes: worldBoxes, mode: "local_onnx", predicted_intrinsics: nil)
     }
 
     // MARK: - Preprocessing
@@ -334,19 +427,20 @@ class LocalInferenceService {
     // MARK: - Inference
 
     private struct ModelOutputs {
-        let predLogits: [Float]      // (5, 200, 1) flattened
-        let predBoxes2d: [Float]     // (5, 200, 4) flattened
-        let predBoxes3d: [Float]     // (5, 200, 12) flattened
-        let predConf3d: [Float]      // (5, 200, 1) flattened
-        let presenceLogits: [Float]  // (5, 1) flattened - category presence
+        let predLogits: [Float]      // (1, 200, 1) flattened = 200 values
+        let predBoxes2d: [Float]     // (1, 200, 4) flattened = 800 values
+        let predBoxes3d: [Float]     // (1, 200, 12) flattened = 2400 values
+        let predConf3d: [Float]      // (1, 200, 1) flattened = 200 values
+        let presenceLogits: [Float]  // (1, 1) flattened = 1 value
     }
 
-    private func runInference(session: ORTSession, input: PreprocessedInput) throws -> ModelOutputs {
+    private func runInference(session: ORTSession, input: PreprocessedInput, tokenIds: ORTValue) throws -> ModelOutputs {
         let outputs = try session.run(
             withInputs: [
                 "image": input.imageArray,
                 "depth": input.depthArray,
                 "intrinsics": input.intrinsicsArray,
+                "token_ids": tokenIds,
             ],
             outputNames: ["pred_logits", "pred_boxes_2d", "pred_boxes_3d", "pred_conf_3d", "presence_logits"],
             runOptions: nil
@@ -364,100 +458,6 @@ class LocalInferenceService {
             predConf3d: try extractFloats(outputs["pred_conf_3d"]!),
             presenceLogits: try extractFloats(outputs["presence_logits"]!)
         )
-    }
-
-    // MARK: - Postprocessing
-
-    private func postprocess(
-        outputs: ModelOutputs,
-        preprocessed: PreprocessedInput,
-        cameraToWorld: [[Float]],
-        scoreThreshold: Float
-    ) -> [BBox3D] {
-        let S = nQueries
-        let N = nPrompts
-        let H = Float(inputSize)
-        let W = Float(inputSize)
-
-        // Step 1: Sigmoid scores with presence modulation
-        // presence_logits: (N_prompts, 1) - indicates if category exists in image
-        var proposals: [(score2d: Float, scoreAll: Float, box2d: [Float], box3d: [Float], classId: Int)] = []
-
-        for p in 0..<N {
-            let presenceScore = sigmoid(outputs.presenceLogits[p])
-
-            for q in 0..<S {
-                let logitIdx = p * S + q
-                let logit2d = outputs.predLogits[logitIdx]
-                let logit3d = outputs.predConf3d[logitIdx]
-                let score2d = sigmoid(logit2d) * presenceScore
-                let score3d = sigmoid(logit3d)
-                let scoreAll = score2d + 0.5 * score3d
-
-                if score2d < scoreThreshold { continue }
-
-                // Extract normalized xyxy
-                let b2dBase = (p * S + q) * 4
-                let box2d = [
-                    outputs.predBoxes2d[b2dBase] * W,
-                    outputs.predBoxes2d[b2dBase + 1] * H,
-                    outputs.predBoxes2d[b2dBase + 2] * W,
-                    outputs.predBoxes2d[b2dBase + 3] * H,
-                ]
-
-                // Extract encoded 3D params
-                let b3dBase = (p * S + q) * 12
-                let box3d = Array(outputs.predBoxes3d[b3dBase..<b3dBase + 12])
-
-                proposals.append((score2d, scoreAll, box2d, box3d, p))
-            }
-        }
-
-        if proposals.isEmpty { return [] }
-
-        // Step 2: Per-class NMS
-        let kept = batchedNMS(proposals: proposals, iouThreshold: iouThreshold)
-
-        // Step 3: Decode 3D boxes + rescale 2D + camera-to-world
-        let K = preprocessed.intrinsicsPadded
-        var worldBoxes: [BBox3D] = []
-
-        for idx in kept {
-            let prop = proposals[idx]
-
-            // 3D decode (replicates coder.py decode)
-            let decoded = decodeBox3D(box2d: prop.box2d, box3dEncoded: prop.box3d, K: K)
-
-            // Camera-to-world transform with Y-flip (source="iphone")
-            let worldResult = cameraToWorldTransform(
-                center: [decoded.cx, decoded.cy, decoded.cz],
-                dims: [decoded.w, decoded.l, decoded.h],
-                quaternion: decoded.quaternion,
-                cameraToWorld: cameraToWorld
-            )
-
-            let classIdx = prop.classId
-            let label = classIdx < bakedPrompts.count ? bakedPrompts[classIdx] : "object"
-            let colorIdx = classIdx % categoryColors.count
-
-            worldBoxes.append(BBox3D(
-                label: label,
-                center: worldResult.center,
-                size: worldResult.size,
-                rotation: worldResult.rotation,
-                color: categoryColors[colorIdx],
-                score: prop.score2d,
-                n_frames: nil,
-                projected_corners: nil
-            ))
-        }
-
-        // Step 4: Cross-class NMS
-        if bakedPrompts.count > 1 && worldBoxes.count > 1 {
-            worldBoxes = crossClassNMS(worldBoxes, distance: nmsDistance)
-        }
-
-        return worldBoxes
     }
 
     // MARK: - 3D Box Decoding

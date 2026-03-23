@@ -15,6 +15,7 @@
 		089C1685E66DB06700FF2AA5 /* BBoxRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 089C1675E66DB06700FF2AA5 /* BBoxRenderer.swift */; };
 		089C1686E66DB06700FF2AA5 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 089C1677E66DB06700FF2AA5 /* Assets.xcassets */; };
 		568A32422F70D2D300FA07DA /* LocalInferenceService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568A32412F70D2D300FA07DA /* LocalInferenceService.swift */; };
+		568A32442F70D2D300FA07DA /* BPETokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568A32432F70D2D300FA07DA /* BPETokenizer.swift */; };
 		B89B886D2952AB6967C62A92 /* Pods_iPhone3DDetect.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0E52372246E35C1458240A39 /* Pods_iPhone3DDetect.framework */; };
 /* End PBXBuildFile section */
 
@@ -32,6 +33,7 @@
 		30E7336CFCD88829A76C2C20 /* Pods-iPhone3DDetect.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-iPhone3DDetect.release.xcconfig"; path = "Target Support Files/Pods-iPhone3DDetect/Pods-iPhone3DDetect.release.xcconfig"; sourceTree = "<group>"; };
 		41A115A23B50808AC1444839 /* Pods-iPhone3DDetect.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-iPhone3DDetect.debug.xcconfig"; path = "Target Support Files/Pods-iPhone3DDetect/Pods-iPhone3DDetect.debug.xcconfig"; sourceTree = "<group>"; };
 		568A32412F70D2D300FA07DA /* LocalInferenceService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInferenceService.swift; sourceTree = "<group>"; };
+		568A32432F70D2D300FA07DA /* BPETokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BPETokenizer.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -62,6 +64,7 @@
 				089C1670E66DB06700FF2AA5 /* AppDelegate.swift */,
 				089C1671E66DB06700FF2AA5 /* SceneDelegate.swift */,
 				568A32412F70D2D300FA07DA /* LocalInferenceService.swift */,
+				568A32432F70D2D300FA07DA /* BPETokenizer.swift */,
 				089C1672E66DB06700FF2AA5 /* ViewController.swift */,
 				089C1673E66DB06700FF2AA5 /* Models.swift */,
 				089C1674E66DB06700FF2AA5 /* DetectionService.swift */,
@@ -189,6 +192,7 @@
 			files = (
 				089C1680E66DB06700FF2AA5 /* AppDelegate.swift in Sources */,
 				568A32422F70D2D300FA07DA /* LocalInferenceService.swift in Sources */,
+				568A32442F70D2D300FA07DA /* BPETokenizer.swift in Sources */,
 				089C1681E66DB06700FF2AA5 /* SceneDelegate.swift in Sources */,
 				089C1682E66DB06700FF2AA5 /* ViewController.swift in Sources */,
 				089C1683E66DB06700FF2AA5 /* Models.swift in Sources */,
