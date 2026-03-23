@@ -53,11 +53,8 @@ class LocalInferenceService {
         env = try ORTEnv(loggingLevel: .warning)
         let options = try ORTSessionOptions()
         try options.setGraphOptimizationLevel(.all)
-
-        // Enable CoreML EP for Neural Engine / GPU acceleration
-        // INT8 single-file model is compatible with CoreML EP
-        let coremlOptions = ORTCoreMLExecutionProviderOptions()
-        try options.appendCoreMLExecutionProvider(with: coremlOptions)
+        // CPU execution with INT8 — no dequantization, low memory usage
+        // ARM NEON provides hardware INT8 acceleration
 
         guard let modelPath = getModelPath() else {
             throw LocalInferenceError.modelNotFound("sam3_3d_raw.onnx")
