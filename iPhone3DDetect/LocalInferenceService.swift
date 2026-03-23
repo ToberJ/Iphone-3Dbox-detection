@@ -137,7 +137,7 @@ class LocalInferenceService {
 
         // 2. Phase 1: Load text encoder, encode all categories, then release
         print("[LocalInference] Phase 1: text encoding (\(categories.count) categories)...")
-        var categoryFeatures: [(features: [Float], mask: [UInt8])] = []
+        var categoryFeatures: [(features: [Float], mask: [Int64])] = []
         do {
             let textSession = try createSession(filename: "text_encoder_int8.onnx")
 
@@ -158,7 +158,7 @@ class LocalInferenceService {
                 let featData = try teOut["text_features"]!.tensorData() as Data
                 let features = featData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
                 let maskData = try teOut["text_mask"]!.tensorData() as Data
-                let mask = maskData.withUnsafeBytes { Array($0.bindMemory(to: UInt8.self)) }
+                let mask = maskData.withUnsafeBytes { Array($0.bindMemory(to: Int64.self)) }
 
                 categoryFeatures.append((features, mask))
             }
@@ -184,11 +184,11 @@ class LocalInferenceService {
                                            shape: [NSNumber(value: contextLength), 1,
                                                    NSNumber(value: textFeatureDim)])
 
-            // Create text_mask ORTValue (1, 32) bool
-            var maskBytes = catFeats.mask
-            let maskData = NSMutableData(bytes: &maskBytes,
-                                          length: maskBytes.count * MemoryLayout<UInt8>.size)
-            let maskValue = try ORTValue(tensorData: maskData, elementType: .bool,
+            // Create text_mask ORTValue (1, 32) int64
+            var maskInt64 = catFeats.mask
+            let maskData = NSMutableData(bytes: &maskInt64,
+                                          length: maskInt64.count * MemoryLayout<Int64>.size)
+            let maskValue = try ORTValue(tensorData: maskData, elementType: .int64,
                                           shape: [1, NSNumber(value: contextLength)])
 
             // Run main model
