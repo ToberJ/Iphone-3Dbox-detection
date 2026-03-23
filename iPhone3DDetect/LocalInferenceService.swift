@@ -135,11 +135,18 @@ class LocalInferenceService {
         let categories = textPrompt.split(separator: ".").map { String($0).trimmingCharacters(in: .whitespaces) }
         let scoreThreshold = DetectionService.shared.scoreThreshold
 
-        // 2. Phase 1: Load text encoder, encode all categories, then release
+        // 2. Phase 1: Load text encoder, encode all categories, then FULLY release
         print("[LocalInference] Phase 1: text encoding (\(categories.count) categories)...")
         var categoryFeatures: [(features: [Float], mask: [Int64])] = []
-        do {
-            let textSession = try createSession(filename: "text_encoder_int8.onnx")
+        // Use separate ORTEnv + autoreleasepool to guarantee memory is freed
+        try autoreleasepool {
+            let textEnv = try ORTEnv(loggingLevel: .warning)
+            let textOptions = try ORTSessionOptions()
+            try textOptions.setGraphOptimizationLevel(.basic)
+            guard let textPath = getFilePath("text_encoder_int8.onnx") else {
+                throw LocalInferenceError.modelNotFound("text_encoder_int8.onnx")
+            }
+            let textSession = try ORTSession(env: textEnv, modelPath: textPath, sessionOptions: textOptions)
 
             for category in categories {
                 let tokenIds = tokenizer.encode(category, contextLength: contextLength)
@@ -155,6 +162,7 @@ class LocalInferenceService {
                     runOptions: nil
                 )
 
+                // Copy data out before session is released
                 let featData = try teOut["text_features"]!.tensorData() as Data
                 let features = featData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
                 let maskData = try teOut["text_mask"]!.tensorData() as Data
@@ -162,14 +170,20 @@ class LocalInferenceService {
 
                 categoryFeatures.append((features, mask))
             }
-            // textSession goes out of scope here -> memory freed
+            // textSession + textEnv deallocated here, autoreleasepool forces immediate cleanup
         }
         let phase1Time = CFAbsoluteTimeGetCurrent() - startTime
-        print("[LocalInference] Phase 1 done in \(String(format: "%.1f", phase1Time))s")
+        print("[LocalInference] Phase 1 done in \(String(format: "%.1f", phase1Time))s, releasing text encoder memory...")
 
-        // 3. Phase 2: Load main model, preprocess, run per category
+        // 3. Phase 2: Load main model with fresh env, preprocess, run per category
         print("[LocalInference] Phase 2: main model inference...")
-        let mainSession = try createSession(filename: "main_model_int8.onnx")
+        let mainEnv = try ORTEnv(loggingLevel: .warning)
+        let mainOptions = try ORTSessionOptions()
+        try mainOptions.setGraphOptimizationLevel(.basic)
+        guard let mainPath = getFilePath("main_model_int8.onnx") else {
+            throw LocalInferenceError.modelNotFound("main_model_int8.onnx")
+        }
+        let mainSession = try ORTSession(env: mainEnv, modelPath: mainPath, sessionOptions: mainOptions)
 
         let preprocessed = try preprocess(capture: capture)
 
