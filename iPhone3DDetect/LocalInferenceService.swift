@@ -65,7 +65,10 @@ class LocalInferenceService {
         guard let path = getFilePath(filename) else { throw LocalInferenceError.modelNotFound(filename) }
         let env = try ORTEnv(loggingLevel: .warning)
         let options = try ORTSessionOptions()
-        try options.setGraphOptimizationLevel(.basic)
+        // Minimize memory: no graph optimization, no memory pre-allocation, single thread
+        try options.setGraphOptimizationLevel(.disable)
+        try options.setMemoryPatternOptimization(false)
+        try options.setIntraOpNumThreads(1)
         let session = try ORTSession(env: env, modelPath: path, sessionOptions: options)
         return (env, session)
     }
