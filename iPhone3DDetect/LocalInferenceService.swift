@@ -66,18 +66,14 @@ class LocalInferenceService {
         print("[LocalInference] Model loaded: \(modelPath)")
     }
 
-    // HuggingFace model URLs
+    // HuggingFace model URL (single INT8 file, ~795MB)
     private static let modelURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/model.onnx"
-    private static let weightsURL = "https://huggingface.co/weikaih/iphone_test/resolve/main/weights.bin"
 
     private func getModelPath() -> String? {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let modelDir = docs.appendingPathComponent("sam3_3d_onnx")
-        let modelPath = modelDir.appendingPathComponent("model.onnx").path
-        let weightsPath = modelDir.appendingPathComponent("weights.bin").path
+        let modelPath = docs.appendingPathComponent("sam3_3d_model.onnx").path
 
-        if FileManager.default.fileExists(atPath: modelPath) &&
-           FileManager.default.fileExists(atPath: weightsPath) {
+        if FileManager.default.fileExists(atPath: modelPath) {
             return modelPath
         }
 
@@ -85,29 +81,16 @@ class LocalInferenceService {
         return Bundle.main.path(forResource: "model", ofType: "onnx")
     }
 
-    /// Download model files from HuggingFace if not present.
+    /// Download model from HuggingFace if not present.
     func downloadModelIfNeeded(progress: @escaping (String) -> Void) async throws {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let modelDir = docs.appendingPathComponent("sam3_3d_onnx")
-        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+        let modelPath = docs.appendingPathComponent("sam3_3d_model.onnx")
 
-        let modelPath = modelDir.appendingPathComponent("model.onnx")
-        let weightsPath = modelDir.appendingPathComponent("weights.bin")
-
-        // Download model.onnx (15MB)
+        // Download model (single file, ~795MB INT8)
         if !FileManager.default.fileExists(atPath: modelPath.path) {
-            progress("Downloading model graph (15MB)...")
-            try await downloadFile(from: Self.modelURL, to: modelPath) { pct in
-                progress("Downloading model graph... \(pct)%")
-            }
-        }
-
-        // Download weights.bin (3GB)
-        if !FileManager.default.fileExists(atPath: weightsPath.path) {
-            progress("Downloading model weights (3GB)...")
-            try await downloadFile(from: Self.weightsURL, to: weightsPath) { pct in
-                progress("Downloading weights... \(pct)%")
-            }
+            progress("Downloading model (795MB)...")
+            let (tempURL, _) = try await URLSession.shared.download(from: URL(string: Self.modelURL)!)
+            try FileManager.default.moveItem(at: tempURL, to: modelPath)
         }
 
         // Verify files exist and are not empty
