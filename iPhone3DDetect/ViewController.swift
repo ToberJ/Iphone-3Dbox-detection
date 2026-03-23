@@ -1713,9 +1713,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
         let unitNames = ["Meters", "Feet", "Centimeters"]
         let nextUnit = unitNames[(unitMode + 1) % 3]
         let unitLabel = "Units: \(unitNames[unitMode]) → \(nextUnit)"
-        let serverLabel = "Server: \(ds.serverName)"
+        let modeStr = useLocalModel ? "Local ONNX" : "Remote API"
 
-        let alert = UIAlertController(title: "Settings", message: serverLabel, preferredStyle: .alert)
+        let alert = UIAlertController(title: "Settings", message: "Inference: \(modeStr)", preferredStyle: .alert)
 
         alert.addTextField { tf in
             tf.text = String(ds.scoreThreshold)
@@ -1729,17 +1729,13 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             }
         })
 
-        alert.addAction(UIAlertAction(title: "Switch to Modal", style: .default) { [weak self] _ in
-            ds.apiUrl = DetectionService.modalUrl
-            ds.warmUp()
-            self?.updateStatus("Server: Modal")
-            print("[Settings] Switched to Modal")
-        })
-
-        alert.addAction(UIAlertAction(title: "Switch to ngrok", style: .default) { [weak self] _ in
-            ds.apiUrl = DetectionService.ngrokUrl
-            self?.updateStatus("Server: ngrok")
-            print("[Settings] Switched to ngrok")
+        let localTitle = useLocalModel ? "Switch to Remote API" : "Switch to Local ONNX"
+        alert.addAction(UIAlertAction(title: localTitle, style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            self.useLocalModel.toggle()
+            let newMode = self.useLocalModel ? "Local ONNX" : "Remote API"
+            self.updateStatus("Inference: \(newMode)")
+            print("[Settings] Inference mode: \(newMode)")
         })
 
         alert.addAction(UIAlertAction(title: unitLabel, style: .default) { [weak self] _ in
@@ -1748,15 +1744,6 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate, PH
             let names = ["Meters", "Feet", "Centimeters"]
             self.updateStatus("Units: \(names[self.unitMode])")
             print("[Settings] Units switched to \(names[self.unitMode])")
-        })
-
-        let localTitle = useLocalModel ? "Switch to Server" : "Switch to Local (ONNX)"
-        alert.addAction(UIAlertAction(title: localTitle, style: .default) { [weak self] _ in
-            guard let self = self else { return }
-            self.useLocalModel.toggle()
-            let modeStr = self.useLocalModel ? "Local (ONNX)" : "Server (\(ds.serverName))"
-            self.updateStatus("Mode: \(modeStr)")
-            print("[Settings] Inference mode: \(modeStr)")
         })
 
         alert.addAction(UIAlertAction(title: "Clear Boxes", style: .destructive) { [weak self] _ in

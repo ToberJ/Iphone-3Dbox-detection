@@ -52,11 +52,10 @@ class LocalInferenceService {
 
         env = try ORTEnv(loggingLevel: .warning)
         let options = try ORTSessionOptions()
-        options.graphOptimizationLevel = .all
+        try options.setGraphOptimizationLevel(.all)
 
-        // Use CoreML EP for ANE acceleration on iPhone
-        let coremlOptions = ORTCoreMLExecutionProviderOptions()
-        try options.appendCoreMLExecutionProvider(with: coremlOptions)
+        // Note: CoreML EP disabled — not compatible with external weights (weights.bin)
+        // Falls back to CPU execution
 
         guard let modelPath = getModelPath() else {
             throw LocalInferenceError.modelNotFound("sam3_3d_raw.onnx")
@@ -98,18 +97,54 @@ class LocalInferenceService {
         // Download model.onnx (15MB)
         if !FileManager.default.fileExists(atPath: modelPath.path) {
             progress("Downloading model graph (15MB)...")
-            let (tempURL, _) = try await URLSession.shared.download(from: URL(string: Self.modelURL)!)
-            try FileManager.default.moveItem(at: tempURL, to: modelPath)
+            try await downloadFile(from: Self.modelURL, to: modelPath) { pct in
+                progress("Downloading model graph... \(pct)%")
+            }
         }
 
         // Download weights.bin (3GB)
         if !FileManager.default.fileExists(atPath: weightsPath.path) {
             progress("Downloading model weights (3GB)...")
-            let (tempURL, _) = try await URLSession.shared.download(from: URL(string: Self.weightsURL)!)
-            try FileManager.default.moveItem(at: tempURL, to: weightsPath)
+            try await downloadFile(from: Self.weightsURL, to: weightsPath) { pct in
+                progress("Downloading weights... \(pct)%")
+            }
+        }
+
+        // Verify files exist and are not empty
+        for (path, name) in [(modelPath, "model.onnx"), (weightsPath, "weights.bin")] {
+            let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
+            let size = attrs[.size] as? Int64 ?? 0
+            if size < 1000 {
+                // File is too small, probably a failed download
+                try FileManager.default.removeItem(at: path)
+                throw LocalInferenceError.modelNotFound("\(name) download incomplete (\(size) bytes). Please try again.")
+            }
+            print("[LocalInference] \(name): \(size / 1_000_000)MB")
         }
 
         progress("Model ready!")
+    }
+
+    /// Download a file with progress reporting.
+    private func downloadFile(from urlString: String, to destination: URL, onProgress: @escaping (Int) -> Void) async throws {
+        guard let url = URL(string: urlString) else {
+            throw LocalInferenceError.modelNotFound("Invalid URL: \(urlString)")
+        }
+
+        let delegate = DownloadProgressDelegate(onProgress: onProgress)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let (tempURL, response) = try await session.download(from: url)
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw LocalInferenceError.modelNotFound("Download failed (HTTP \(code)): \(urlString)")
+        }
+
+        // Remove existing file if present (e.g., partial download from before)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.moveItem(at: tempURL, to: destination)
     }
 
     // MARK: - Detection (same interface as DetectionService)
@@ -373,7 +408,7 @@ class LocalInferenceService {
                 let logitIdx = p * S + q
                 let logit2d = outputs.predLogits[logitIdx]
                 let logit3d = outputs.predConf3d[logitIdx]
-                var score2d = sigmoid(logit2d) * presenceScore
+                let score2d = sigmoid(logit2d) * presenceScore
                 let score3d = sigmoid(logit3d)
                 let scoreAll = score2d + 0.5 * score3d
 
@@ -739,5 +774,32 @@ enum LocalInferenceError: LocalizedError {
         case .notLoaded: return "Models not loaded"
         case .invalidImage: return "Failed to process image"
         }
+    }
+}
+
+// MARK: - Download Progress Delegate
+
+private class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+    let onProgress: (Int) -> Void
+    private var lastReported = -1
+
+    init(onProgress: @escaping (Int) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        let pct = Int(totalBytesWritten * 100 / totalBytesExpectedToWrite)
+        if pct != lastReported {
+            lastReported = pct
+            onProgress(pct)
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        // Required delegate method — actual file move handled in downloadFile()
     }
 }
